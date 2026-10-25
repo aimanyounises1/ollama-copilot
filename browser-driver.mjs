@@ -32,11 +32,11 @@ export class BrowserDriver {
     const generation = this.generation;
     let tabs;
     try { tabs = await this.chrome.tabs.query({ active: true, lastFocusedWindow: true }); }
-    catch { throw new BrowserDriverError("site_access_required", "Click JEV's toolbar icon on the website you want it to use."); }
+    catch { throw new BrowserDriverError("site_access_required", "Click Ollama Copilot's toolbar icon on the website you want it to use."); }
     if (generation !== this.generation) throw abortError();
     const tab = tabs[0];
     if (!tab || !Number.isInteger(tab.id) || !tab.url) {
-      throw new BrowserDriverError("site_access_required", "Click JEV's toolbar icon on a public website, then start the task.");
+      throw new BrowserDriverError("site_access_required", "Click Ollama Copilot's toolbar icon on a public website, then start the task.");
     }
     this.startUrl = safePublicUrl(tab.url);
     this.lastDocumentId = null;
@@ -51,7 +51,7 @@ export class BrowserDriver {
     // This method must be called by the panel's explicit permission button.
     let tabs;
     try { tabs = await this.chrome.tabs.query({ active: true, lastFocusedWindow: true }); }
-    catch { throw new BrowserDriverError("site_access_required", "Click JEV's toolbar icon on this website to grant temporary access."); }
+    catch { throw new BrowserDriverError("site_access_required", "Click Ollama Copilot's toolbar icon on this website to grant temporary access."); }
     const tab = tabs[0];
     const target = tab?.url || this.pendingOrigin;
     if (!target || this.tabId !== null && tab?.id !== this.tabId) {
@@ -61,7 +61,7 @@ export class BrowserDriver {
     const pattern = `${url.protocol}//${url.hostname}/*`;
     let granted;
     try { granted = await this.chrome.permissions.request({ origins: [pattern] }); }
-    catch { throw new BrowserDriverError("site_access_required", "Chrome could not request site access. Use JEV's toolbar icon on this website."); }
+    catch { throw new BrowserDriverError("site_access_required", "Chrome could not request site access. Use Ollama Copilot's toolbar icon on this website."); }
     if (!granted) throw new BrowserDriverError("site_access_required", "Site access was not granted. You can continue browsing manually.");
     return true;
   }
@@ -78,7 +78,7 @@ export class BrowserDriver {
     if (!tab || tab.id !== this.tabId) {
       throw new BrowserDriverError("tab_changed", "The active Chrome tab changed. Return to the controlled tab or start a new task.");
     }
-    if (!tab.url) throw new BrowserDriverError("site_access_required", "Click JEV's toolbar icon on the new website or use Allow this website.");
+    if (!tab.url) throw new BrowserDriverError("site_access_required", "Click Ollama Copilot's toolbar icon on the new website or use Allow this website.");
     safePublicUrl(tab.url);
     return tab;
   }
@@ -171,7 +171,7 @@ export class BrowserDriver {
         target: { tabId: this.tabId, frameIds: [0] }, files: ["content.js"], world: "ISOLATED",
       });
     } catch {
-      throw new BrowserDriverError("site_access_required", "JEV needs access to this website. Click Allow this website or its toolbar icon.");
+      throw new BrowserDriverError("site_access_required", "Ollama Copilot needs access to this website. Click Allow this website or its toolbar icon.");
     }
     if (this.cancelled || generation !== this.generation) throw abortError();
     const documentId = results.find((result) => result.frameId === 0)?.documentId;
@@ -208,7 +208,7 @@ export class BrowserDriver {
       if (this.port !== port) return;
       const message = this.cancelled ? abortError() : new BrowserDriverError("document_disconnected", "The page connection ended. Observe the new page before continuing.");
       this._closePort(message);
-      if (error) console.debug("JEV page connection ended:", error.message);
+      if (error) console.debug("Ollama Copilot page connection ended:", error.message);
     });
   }
 

@@ -38,7 +38,7 @@ export function escapeMarkdown(value) {
 
 /** Report prose is fixed; every finding is an exact captured excerpt with its source. */
 export function createReport(state) {
-  const lines = [`# ${escapeMarkdown(state.goal || "JEV browser research")}`, "", `Task status: ${escapeMarkdown(state.status.replaceAll("_", " "))}.`, ""];
+  const lines = [`# ${escapeMarkdown(state.goal || "Ollama Copilot research")}`, "", `Task status: ${escapeMarkdown(state.status.replaceAll("_", " "))}.`, ""];
   if (!state.sources.length) return [...lines, "No source evidence has been captured."].join("\n");
   lines.push("## Captured excerpts", "");
   for (const source of state.sources) {
@@ -65,7 +65,7 @@ function safeObservation(value) {
   return { ...value, snapshot_id: text(value.snapshot_id, LIMITS.maxSnapshotChars), url: sourceUrl(value.url), title: pageTitle(value.title), text: text(value.text, LIMITS.maxSourceChars, true) };
 }
 function publicError(error) {
-  return SAFE_ERROR_NAMES.has(error?.name) && typeof error?.code === "string" && typeof error?.message === "string" && error.message.length <= CAPTURE_LIMITS.activityChars ? error.message : "JEV could not confirm a browser or model operation. Check the model connection and website access, then start again.";
+  return SAFE_ERROR_NAMES.has(error?.name) && typeof error?.code === "string" && typeof error?.message === "string" && error.message.length <= CAPTURE_LIMITS.activityChars ? error.message : "Ollama Copilot could not confirm a browser or model operation. Check the model connection and website access, then start again.";
 }
 function initialState(id, goal, maximum, now) {
   return { id, goal, status: "idle", step: 0, maxSteps: maximum, tab: null, sources: [], actions: [], activity: [], route: null, report: "", error: null, startedAt: now, updatedAt: now };

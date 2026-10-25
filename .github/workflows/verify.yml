@@ -1,4 +1,4 @@
-name: Verify JEV Browser
+name: Verify Ollama Copilot
 on: [push, pull_request]
 permissions:
   contents: read

@@ -4,17 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>JEV Browser</title>
+  <title>Ollama Copilot</title>
   <link rel="stylesheet" href="sidepanel.css">
   <script type="module" src="panel.mjs"></script>
 </head>
 <body>
   <header class="app-header">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">j</span>
+      <span class="brand-mark" aria-hidden="true">O</span>
       <div>
-        <h1>JEV Browser</h1>
-        <p class="brand-caption">Local decision router</p>
+        <h1>Ollama Copilot</h1>
+        <p class="brand-caption">Your local browser assistant</p>
       </div>
     </div>
     <p id="connection-status" class="connection-status" role="status">Not connected</p>
@@ -23,7 +23,7 @@
   <main>
     <section class="task-section" aria-labelledby="task-heading">
       <div class="section-heading">
-        <h2 id="task-heading">What should JEV do?</h2>
+        <h2 id="task-heading">What should Ollama Copilot do?</h2>
       </div>
       <div class="tab-scope">
         <div class="tab-scope-copy">
@@ -33,9 +33,9 @@
         <button id="grant-site" class="text-button" type="button">Allow this website</button>
       </div>
       <form id="task-form">
-        <label class="visually-hidden" for="goal">Task for JEV</label>
+        <label class="visually-hidden" for="goal">Task for Ollama Copilot</label>
         <textarea id="goal" name="goal" rows="4" maxlength="800" required placeholder="Find public AI engineering jobs and compare the employer career pages."></textarea>
-        <p class="scope-note">JEV uses the tab you select. Review account changes yourself.</p>
+        <p class="scope-note">Ollama Copilot uses the tab you select. Review account changes yourself.</p>
         <div class="task-actions">
           <button id="start-button" class="primary-button" type="submit">Start on this tab</button>
           <button id="stop-button" class="secondary-button" type="button" disabled>Stop</button>
@@ -55,7 +55,7 @@
     <details id="settings-panel" class="settings-panel">
       <summary>Models and settings<span class="summary-hint">Configure</span></summary>
       <div class="settings-content">
-        <p class="section-description">Connect your Ollama server and choose the models JEV can use.</p>
+        <p class="section-description">Connect your Ollama server and choose the models Ollama Copilot can use.</p>
         <label for="ollama-url">Ollama server</label>
         <input id="ollama-url" name="ollama-url" type="url" autocomplete="off" spellcheck="false" required>
 
@@ -98,7 +98,7 @@
         <h2 id="sources-heading">Sources</h2>
       </div>
       <ul id="sources-list" class="sources-list"></ul>
-      <p class="empty-state">Sources appear when JEV extracts a page.</p>
+      <p class="empty-state">Sources appear when Ollama Copilot extracts a page.</p>
     </section>
 
     <section class="activity-section" aria-labelledby="activity-heading">

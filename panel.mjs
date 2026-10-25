@@ -7,7 +7,7 @@ import { AgentRun, restoreCheckpoint, sourceUrl } from "./controller.mjs";
 const STORAGE_KEYS = Object.freeze({ settings: "jevSettings", checkpoint: "jevCheckpoint" });
 const ACTIVE = new Set(["running", "stopping"]);
 const FIELD_IDS = Object.freeze(["ollama-url", "decision-model", "fast-model", "strong-model", "max-steps", "typing-delay", "search-url"]);
-const STATUS_TEXT = Object.freeze({ idle: "Ready when you are.", running: "JEV is working on the selected tab.", stopping: "Stopping browser control…", stopped: "Stopped. Captured evidence is retained.", completed: "Task complete. Captured evidence is ready.", paused: "Paused for review.", failed: "The task needs attention.", limit_reached: "Step limit reached. Captured evidence is retained.", interrupted: "Previous task interrupted. Start again to continue." });
+const STATUS_TEXT = Object.freeze({ idle: "Ready when you are.", running: "Ollama Copilot is working on the selected tab.", stopping: "Stopping browser control…", stopped: "Stopped. Captured evidence is retained.", completed: "Task complete. Captured evidence is ready.", paused: "Paused for review.", failed: "The task needs attention.", limit_reached: "Step limit reached. Captured evidence is retained.", interrupted: "Previous task interrupted. Start again to continue." });
 const byId = id => document.getElementById(id);
 let settings = validateSettings(DEFAULT_SETTINGS);
 let currentRun = null;
@@ -67,7 +67,7 @@ function render(state) {
   controls();
 }
 function safeMessage(error) {
-  return ["ModelClientError", "BrowserDriverError", "AgentRunError"].includes(error?.name) && typeof error.message === "string" ? error.message : "JEV could not complete this operation. Check model settings and website access.";
+  return ["ModelClientError", "BrowserDriverError", "AgentRunError"].includes(error?.name) && typeof error.message === "string" ? error.message : "Ollama Copilot could not complete this operation. Check model settings and website access.";
 }
 async function checkpoint(state) {
   render(state);
@@ -137,7 +137,7 @@ function exportResearch() {
   const blob = new Blob([currentState.report], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a"); anchor.href = url;
-  anchor.download = `jev-research-${currentState.id.slice(0, 12)}.md`;
+  anchor.download = `ollama-copilot-research-${currentState.id.slice(0, 12)}.md`;
   document.body.append(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(url);
 }
 async function initialize() {
@@ -165,6 +165,6 @@ async function initialize() {
 }
 window.addEventListener("pagehide", () => {
   healthAbort?.abort();
-  if (currentRun?.isRunning) currentRun.stop().catch(() => console.warn("JEV could not persist the final Stop checkpoint after the panel closed."));
+  if (currentRun?.isRunning) currentRun.stop().catch(() => console.warn("Ollama Copilot could not persist the final Stop checkpoint after the panel closed."));
 });
 initialize();

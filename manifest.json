@@ -1,14 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "JEV Browser",
+  "name": "Ollama Copilot",
   "version": "0.1.0",
-  "description": "Local decision-model routing and visible, user-controlled browser research.",
+  "description": "Control your browser with local Ollama models.",
   "minimum_chrome_version": "116",
   "permissions": ["sidePanel", "activeTab", "scripting", "storage"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
   "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": {"service_worker": "background.js"},
-  "action": {"default_title": "Open JEV Browser"},
+  "action": {"default_title": "Open Ollama Copilot"},
   "side_panel": {"default_path": "sidepanel.html"},
   "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"}
 }

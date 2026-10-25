@@ -1,4 +1,4 @@
-# JEV Browser
+# Ollama Copilot
 
 An open-source Chrome side-panel agent with local decision-model routing. Give it a task on a selected tab, watch the real page change, and inspect the model route, action journal and captured sources.
 
@@ -29,7 +29,7 @@ The extension supports public web search, observed links, clicking, paced DOM ty
 2. Install the configured models. Defaults are `tev1:4b` for decisions and `qwen3.8:latest` for both chat-model tiers, following the project owner's selection. You can configure different compatible local chat models for the two routing tiers in Settings.
 3. Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select this folder containing `manifest.json`.
 4. Copy the extension ID from its card. Configure Ollama to allow that exact extension origin, following the [Ollama FAQ](https://docs.ollama.com/faq). When running Ollama from a terminal, the origin setting is `OLLAMA_ORIGINS=chrome-extension://YOUR_EXTENSION_ID`. Restart your Ollama service with that setting. Preserve any other explicitly trusted origins already required by your setup.
-5. Pin JEV Browser, open a public website, and click the extension icon. In Settings, check the endpoint and model choices, then choose **Check models**.
+5. Pin Ollama Copilot, open a public website, and click the extension icon. In Settings, check the endpoint and model choices, then choose **Check models**.
 6. Enter a task and select **Start on this tab**. Use **Allow this website** when a site grant is needed. Stop ends inference and disconnects the execution channel. Reopening the panel marks unfinished work interrupted; actions are never replayed automatically.
 
 The extension accepts only loopback Ollama endpoints and rejects models advertised as remote/cloud-backed. The endpoint defaults to the standard local Ollama service. No Python backend, API key or npm runtime dependency is required.
@@ -75,6 +75,6 @@ python -m playwright install chromium
 python -m pytest -q tests
 ```
 
-The parent JEV workspace also includes this extension in `.claude/docs-first/verify.sh`. Mocked model checks, real DOM fixtures and live-model evaluations are reported separately. No single example establishes reliable behavior on every website.
+The parent research workspace also includes this extension in `.claude/docs-first/verify.sh`. Mocked model checks, real DOM fixtures and live-model evaluations are reported separately. No single example establishes reliable behavior on every website.
 
 The source folder is a standalone GitHub publication unit. Do not copy `.env`, local browser profiles, research history, credentials, or the parent workspace's outputs into a public repository.

@@ -1,9 +1,9 @@
 {
-  "name": "jev-browser-extension",
+  "name": "ollama-copilot",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local-first Chrome agent with typed decision routing and observed browser actions",
+  "description": "Chrome copilot with local model routing and observed browser actions",
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "check": "node --check background.js && node --check browser-driver.mjs && node --check config.mjs && node --check content.js && node --check controller.mjs && node --check model-client.mjs && node --check panel.mjs && node --check policy.mjs && node --check prompts.mjs"
