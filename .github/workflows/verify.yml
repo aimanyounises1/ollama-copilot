@@ -1,0 +1,19 @@
+name: Verify JEV Browser
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "26.3.0"
+          package-manager-cache: false
+      - run: npm test
+      - run: npm run check
+      - run: python3 -m venv .test-venv
+      - run: .test-venv/bin/python -m pip install pytest==9.1.1 playwright==1.64.1
+      - run: .test-venv/bin/python -m playwright install --with-deps chromium
+      - run: .test-venv/bin/python -m pytest -q tests

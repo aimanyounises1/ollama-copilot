@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>JEV Browser</title>
+  <link rel="stylesheet" href="sidepanel.css">
+  <script type="module" src="panel.mjs"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">j</span>
+      <div>
+        <h1>JEV Browser</h1>
+        <p class="brand-caption">Local decision router</p>
+      </div>
+    </div>
+    <p id="connection-status" class="connection-status" role="status">Not connected</p>
+  </header>
+
+  <main>
+    <section class="task-section" aria-labelledby="task-heading">
+      <div class="section-heading">
+        <h2 id="task-heading">What should JEV do?</h2>
+      </div>
+      <div class="tab-scope">
+        <div class="tab-scope-copy">
+          <span class="scope-label">Current tab</span>
+          <p id="tab-status">Select a website to work with.</p>
+        </div>
+        <button id="grant-site" class="text-button" type="button">Allow this website</button>
+      </div>
+      <form id="task-form">
+        <label class="visually-hidden" for="goal">Task for JEV</label>
+        <textarea id="goal" name="goal" rows="4" maxlength="800" required placeholder="Find public AI engineering jobs and compare the employer career pages."></textarea>
+        <p class="scope-note">JEV uses the tab you select. Review account changes yourself.</p>
+        <div class="task-actions">
+          <button id="start-button" class="primary-button" type="submit">Start on this tab</button>
+          <button id="stop-button" class="secondary-button" type="button" disabled>Stop</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="run-section" aria-label="Task progress">
+      <div class="run-status-line">
+        <span class="run-indicator" aria-hidden="true"></span>
+        <p id="run-status" role="status" aria-live="polite">Ready when you are.</p>
+      </div>
+      <progress id="run-progress" max="1" value="0" aria-label="Task progress"></progress>
+      <p id="route-status" class="route-status">The decision model chooses a configured LLM.</p>
+    </section>
+
+    <details id="settings-panel" class="settings-panel">
+      <summary>Models and settings<span class="summary-hint">Configure</span></summary>
+      <div class="settings-content">
+        <p class="section-description">Connect your Ollama server and choose the models JEV can use.</p>
+        <label for="ollama-url">Ollama server</label>
+        <input id="ollama-url" name="ollama-url" type="url" autocomplete="off" spellcheck="false" required>
+
+        <label for="decision-model">Decision model</label>
+        <input id="decision-model" name="decision-model" type="text" autocomplete="off" spellcheck="false" required>
+
+        <div class="settings-pair">
+          <div>
+            <label for="fast-model">Fast LLM</label>
+            <input id="fast-model" name="fast-model" type="text" autocomplete="off" spellcheck="false" required>
+          </div>
+          <div>
+            <label for="strong-model">Strong LLM</label>
+            <input id="strong-model" name="strong-model" type="text" autocomplete="off" spellcheck="false" required>
+          </div>
+        </div>
+        <div class="settings-pair settings-numbers">
+          <div>
+            <label for="max-steps">Step limit</label>
+            <input id="max-steps" name="max-steps" type="number" inputmode="numeric" required>
+          </div>
+          <div>
+            <label for="typing-delay">Typing delay <span class="unit">ms</span></label>
+            <input id="typing-delay" name="typing-delay" type="number" inputmode="numeric" required>
+          </div>
+        </div>
+
+        <label for="search-url">Search provider URL</label>
+        <input id="search-url" name="search-url" type="url" autocomplete="off" spellcheck="false" required>
+
+        <div class="settings-actions">
+          <button id="save-settings" class="secondary-button" type="button">Save settings</button>
+          <button id="check-models" class="secondary-button" type="button">Check models</button>
+        </div>
+      </div>
+    </details>
+
+    <section class="evidence-section" aria-labelledby="sources-heading">
+      <div class="section-heading">
+        <h2 id="sources-heading">Sources</h2>
+      </div>
+      <ul id="sources-list" class="sources-list"></ul>
+      <p class="empty-state">Sources appear when JEV extracts a page.</p>
+    </section>
+
+    <section class="activity-section" aria-labelledby="activity-heading">
+      <div class="section-heading">
+        <h2 id="activity-heading">Activity</h2>
+      </div>
+      <ol id="activity-list" class="activity-list"></ol>
+      <p class="empty-state">Browser actions and model decisions appear here.</p>
+    </section>
+
+    <section class="report-section" aria-labelledby="report-heading">
+      <div class="section-heading report-heading">
+        <h2 id="report-heading">Captured research</h2>
+        <button id="export-button" class="text-button" type="button" disabled>Export research</button>
+      </div>
+      <pre id="report-content" tabindex="0" aria-label="Captured research">Captured page evidence will appear here.</pre>
+    </section>
+  </main>
+  <footer class="app-footer">Local models. Visible browser actions.</footer>
+</body>
+</html>
