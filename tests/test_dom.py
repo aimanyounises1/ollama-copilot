@@ -153,6 +153,115 @@ def test_paced_typing_emits_intermediate_input_and_get_search_navigates(actor):
     assert parse_qs(urlsplit(actor.url).query) == {"q": ["asyncio"], "area": ["default"]}
 
 
+def append_file_picker(actor, *, name=None, hidden=True, inside_form=True):
+    """Add an ordinary native file control to the isolated public-search fixture."""
+    actor.evaluate("""options => {
+        const field=document.createElement('input');
+        field.id='aux-file'; field.type='file'; field.hidden=options.hidden;
+        if (options.name !== null) field.name=options.name;
+        (options.inside_form ? document.querySelector('form') : document.body).append(field);
+    }""", {"name": name, "hidden": hidden, "inside_form": inside_form})
+
+
+def select_fixture_file(actor):
+    """Set synthetic fixture bytes only; the actor must prevent their submission."""
+    actor.locator("#aux-file").set_input_files({"name": "fixture.txt", "mimeType": "text/plain", "buffer": b"fixture-only"})
+    assert actor.evaluate("() => document.querySelector('#aux-file').files.length") == 1
+
+
+@pytest.mark.parametrize("name", [None, ""])
+@pytest.mark.parametrize("kind", ["click", "press"])
+def test_empty_unnamed_hidden_file_pickers_allow_public_get_search(actor, name, kind):
+    append_file_picker(actor, name=name)
+    actor.evaluate("() => { const field=document.querySelector('#aux-file'); field.after(field.cloneNode()); }")
+    assert actor.evaluate("() => Array.from(document.querySelectorAll('input[type=file]'), field => field.files.length)") == [0, 0]
+    first = observation(actor)
+    assert execute(actor, action_for(first, "type", "Search jobs", text="backend Israel"))["status"] == "executed"
+    assert actor.locator("#query").input_value() == "backend Israel"
+    assert actor.url == HOME
+    snapshot = observation(actor)
+    action = action_for(snapshot, "click", "Go") if kind == "click" else action_for(snapshot, "press", "Search jobs", key="Enter")
+    assert execute(actor, action)["navigation"] is True
+    actor.wait_for_url("**/search?**")
+    assert parse_qs(urlsplit(actor.url).query) == {"q": ["backend Israel"], "area": ["default"]}
+
+
+@pytest.mark.parametrize("variant", ["named", "space-name", "selected", "visible", "css-only-hidden", "hidden-visible", "until-found", "unknown-files", "fake-files"])
+def test_file_picker_exception_rejects_other_file_states(actor, variant):
+    append_file_picker(actor)
+    if variant == "selected":
+        select_fixture_file(actor)
+    else:
+        actor.evaluate("""variant => {
+            const field=document.querySelector('#aux-file');
+            if (variant === 'named') field.name='attachment';
+            if (variant === 'space-name') field.name=' ';
+            if (variant === 'visible') field.hidden=false;
+            if (variant === 'css-only-hidden') { field.hidden=false; field.style.display='none'; }
+            if (variant === 'hidden-visible') field.style.display='block';
+            if (variant === 'until-found') field.hidden='until-found';
+            if (variant === 'unknown-files') Object.defineProperty(field,'files',{value:null});
+            if (variant === 'fake-files') Object.defineProperty(field,'files',{value:{length:0}});
+        }""", variant)
+    first = observation(actor)
+    assert failure(actor, action_for(first, "type", "Search jobs", text="blocked"))["code"] == "manual_review"
+    assert actor.locator("#query").input_value() == ""
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "click", "Go"))["code"] == "manual_review"
+    assert actor.url == HOME
+
+
+@pytest.mark.parametrize("mutation", ["named", "selected"])
+def test_file_state_changes_during_typing_stop_before_the_next_character(actor, mutation):
+    append_file_picker(actor, inside_form=mutation != "selected")
+    if mutation == "selected":
+        select_fixture_file(actor)
+    actor.evaluate("""mutation => document.querySelector('#query').addEventListener('input', event => {
+        if (event.target.value !== 'a') return;
+        const field=document.querySelector('#aux-file');
+        if (mutation === 'named') field.name='attachment';
+        else document.querySelector('form').append(field);
+    })""", mutation)
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "type", "Search jobs", text="abc"))["code"] == "manual_review"
+    assert actor.locator("#query").input_value() == "a"
+    assert actor.url == HOME
+
+
+@pytest.mark.parametrize("kind", ["click", "press"])
+def test_file_selected_after_typing_prevents_get_submission(actor, kind):
+    append_file_picker(actor)
+    first = observation(actor)
+    assert execute(actor, action_for(first, "type", "Search jobs", text="public query"))["status"] == "executed"
+    select_fixture_file(actor)
+    snapshot = observation(actor)
+    action = action_for(snapshot, "click", "Go") if kind == "click" else action_for(snapshot, "press", "Search jobs", key="Enter")
+    assert failure(actor, action)["code"] == "manual_review"
+    assert actor.url == HOME
+
+
+@pytest.mark.parametrize("boundary", ["post", "credential"])
+def test_empty_auxiliary_picker_does_not_relax_other_form_boundaries(actor, boundary):
+    append_file_picker(actor)
+    actor.evaluate("""boundary => {
+        const form=document.querySelector('form');
+        if (boundary === 'post') form.method='post';
+        else { const credential=document.createElement('input'); credential.type='hidden'; credential.name='access_token'; form.append(credential); }
+    }""", boundary)
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "type", "Search jobs", text="blocked"))["code"] == "manual_review"
+    assert actor.locator("#query").input_value() == ""
+    assert actor.url == HOME
+
+
+def test_direct_file_control_target_still_requires_manual_handling(actor):
+    append_file_picker(actor, hidden=False)
+    actor.evaluate("() => document.querySelector('#aux-file').setAttribute('aria-label','Search file')")
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "click", "Search file"))["code"] == "manual_review"
+    assert actor.evaluate("() => document.querySelector('#aux-file').files.length") == 0
+
+
 def test_link_click_uses_observed_public_destination(actor):
     snapshot = observation(actor)
     result = execute(actor, action_for(snapshot, "click", "Documentation"))

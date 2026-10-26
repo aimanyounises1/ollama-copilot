@@ -139,6 +139,11 @@
     }
     for (const control of form.elements) {
       const info = metadata(control);
+      // Empty unnamed auxiliary pickers do not contribute a GET form entry.
+      const emptyAuxiliaryFile = info.tag === "input" && info.type === "file" &&
+        control.hidden === true && !visible(control) && info.name === "" &&
+        control.files instanceof FileList && control.files.length === 0;
+      if (emptyAuxiliaryFile) continue;
       if (info.sensitive || /(?:password|token|secret|csrf|auth|session|credential)/i.test(info.name)) {
         fail("manual_review", "This form contains a sensitive control and needs manual handling.");
       }
