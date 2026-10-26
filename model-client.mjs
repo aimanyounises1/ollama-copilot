@@ -286,11 +286,11 @@ export class ModelClient {
     const modelUncertain = model.confidence < this.settings.routeConfidence;
     const toolUncertain = tool.confidence < this.settings.routeConfidence;
     const modelRole = modelUncertain ? "strong" : model.choice;
-    const toolStrategy = toolUncertain ? "read" : tool.choice;
+    const toolStrategy = toolUncertain ? "interact" : tool.choice;
     // Model-tier uncertainty must not erase an independently accepted tool choice.
     const reasons = [];
     if (modelUncertain) reasons.push("Model selection was uncertain; use the configured stronger model.");
-    if (toolUncertain) reasons.push("Tool selection was uncertain; use the read strategy.");
+    if (toolUncertain) reasons.push("Tool selection was uncertain; use the interact strategy with observed controls.");
     else if (modelUncertain) reasons.push(`Retain the selected ${toolStrategy} strategy.`);
     return {
       model: modelRole === "fast" ? this.settings.fastModel : this.settings.strongModel,

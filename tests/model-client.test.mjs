@@ -75,34 +75,44 @@ test("uncertain model tier retains a separately accepted browser interaction", a
   }
 });
 
-test("uncertain tool selects read without changing an accepted model tier", async () => {
+test("uncertain tool preserves each accepted model tier and enables the registered interact strategy", async () => {
   for (const modelRole of ["fast", "strong"]) {
-    const modelChoice = pick(modelRole, ["fast", "strong"]);
-    const toolChoice = pick("search", ["read", "interact", "search"], 0.05);
-    const route = await fixture({ modelChoice, toolChoice }).client.route("Read public evidence", OBSERVATION);
-    assert.equal(route.modelRole, modelRole);
-    assert.equal(route.model, modelRole === "fast" ? TEST_SETTINGS.fastModel : TEST_SETTINGS.strongModel);
-    assert.equal(route.tool, "read");
-    assert.equal(route.confidence, toolChoice.confidence);
-    assert.equal(route.fallbackReason, "Tool selection was uncertain; use the read strategy.");
+    for (const selectedTool of ["read", "interact", "search"]) {
+      const modelChoice = pick(modelRole, ["fast", "strong"]);
+      const toolChoice = pick(selectedTool, ["read", "interact", "search"], DEFAULT_SETTINGS.routeConfidence / 2);
+      const route = await fixture({ modelChoice, toolChoice }).client.route("Read public evidence", OBSERVATION);
+      assert.equal(route.modelRole, modelRole);
+      assert.equal(route.model, modelRole === "fast" ? TEST_SETTINGS.fastModel : TEST_SETTINGS.strongModel);
+      assert.equal(route.tool, "interact");
+      assert.equal(route.confidence, toolChoice.confidence);
+      assert.equal(route.fallbackReason, "Tool selection was uncertain; use the interact strategy with observed controls.");
+    }
   }
 });
 
 test("independent fallbacks both apply when model and tool are uncertain", async () => {
-  const route = await fixture({ modelChoice: pick("fast", ["fast", "strong"], 0.05), toolChoice: pick("interact", ["read", "interact", "search"], 0.05) }).client.route("Read", OBSERVATION);
-  assert.equal(route.model, TEST_SETTINGS.strongModel);
-  assert.equal(route.modelRole, "strong");
-  assert.equal(route.tool, "read");
-  assert.match(route.fallbackReason, /Model selection was uncertain/);
-  assert.match(route.fallbackReason, /Tool selection was uncertain/);
+  for (const selectedModel of ["fast", "strong"]) {
+    for (const selectedTool of ["read", "interact", "search"]) {
+      const uncertain = DEFAULT_SETTINGS.routeConfidence / 2;
+      const route = await fixture({ modelChoice: pick(selectedModel, ["fast", "strong"], uncertain), toolChoice: pick(selectedTool, ["read", "interact", "search"], uncertain) }).client.route("Read", OBSERVATION);
+      assert.equal(route.model, TEST_SETTINGS.strongModel);
+      assert.equal(route.modelRole, "strong");
+      assert.equal(route.tool, "interact");
+      assert.equal(route.confidence, uncertain);
+      assert.match(route.fallbackReason, /Model selection was uncertain/);
+      assert.match(route.fallbackReason, /Tool selection was uncertain; use the interact strategy with observed controls/);
+    }
+  }
 });
 
 test("routing keeps the existing confidence boundary and relevance threshold", async () => {
   const boundary = DEFAULT_SETTINGS.routeConfidence;
-  const route = await fixture({ modelChoice: pick("fast", ["fast", "strong"], boundary), toolChoice: pick("search", ["read", "interact", "search"], boundary) }).client.route("Search public sources", OBSERVATION);
-  assert.equal(route.modelRole, "fast");
-  assert.equal(route.tool, "search");
-  assert.equal(route.fallbackReason, null);
+  for (const selectedTool of ["read", "interact", "search"]) {
+    const route = await fixture({ modelChoice: pick("fast", ["fast", "strong"], boundary), toolChoice: pick(selectedTool, ["read", "interact", "search"], boundary) }).client.route("Research public sources", OBSERVATION);
+    assert.equal(route.modelRole, "fast");
+    assert.equal(route.tool, selectedTool);
+    assert.equal(route.fallbackReason, null);
+  }
   assert.equal(DEFAULT_SETTINGS.minimumRelevance, 0.55);
 });
 
@@ -394,3 +404,106 @@ for (const metadata of ["controls", "tabs"]) {
     assert.ok(calls.every(call => [ENDPOINTS.models, ENDPOINTS.show].includes(call.path)));
   });
 }
+
+
+const CAREER_INDEX_OBSERVATION = Object.freeze({
+  ...TASK_OBSERVATION, title: "Careers", text: "Career index: open an observed individual role to verify its title, location and requirements. This index is only a discovery lead.",
+});
+const CAREER_RESEARCH_GOAL = "Find and research a senior AI or backend engineering job in Israel.";
+const uncertainTool = selected => pick(selected, ["read", "interact", "search"], DEFAULT_SETTINGS.routeConfidence / 2);
+
+for (const action of [
+  { kind: "navigate", snapshot_id: OBSERVATION.snapshot_id, url: OBSERVATION.elements[1].href, reason: "Read an observed individual listing" },
+  { kind: "open_tab", snapshot_id: OBSERVATION.snapshot_id, target_id: "e2", reason: "Open the observed listing in a task tab" },
+  { kind: "switch_tab", snapshot_id: OBSERVATION.snapshot_id, tab_ref: "task-detail", reason: "Inspect the observed detail tab" },
+]) {
+  test(`uncertain career-index routing can propose observed ${action.kind} without automatic replanning`, async () => {
+    const { client, calls } = fixture({ toolChoice: uncertainTool("read"), action });
+    const route = await client.route(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION);
+    assert.equal(route.tool, "interact");
+    assert.equal(route.model, TEST_SETTINGS.fastModel);
+    assert.deepEqual(await client.propose(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION, [], route), action);
+    const { chat, supplied } = chatInput(calls);
+    assert.deepEqual(chat.payload.format.properties.kind.enum, ["navigate", "click", "type", "press", "back", "open_tab", "switch_tab", "extract", "done"]);
+    assert.deepEqual(chat.payload.format.properties.target_id.enum, ["e1", "e2", null]);
+    assert.deepEqual(chat.payload.format.properties.tab_ref.enum, ["task-detail", null]);
+    assert.equal(chat.payload.format.additionalProperties, false);
+    assert.equal(supplied.route.tool, "interact");
+    assert.equal(supplied.observation.text, CAREER_INDEX_OBSERVATION.text);
+    assert.equal(calls.filter(call => call.path === ENDPOINTS.decisions).length, 1);
+    assert.equal(calls.filter(call => call.path === ENDPOINTS.chat).length, 1);
+  });
+}
+
+test("confident read keeps its extraction schema even when a career index contains reading links", async () => {
+  const f = fixture({ toolChoice: pick("read", ["read", "interact", "search"]), action: EXTRACT_ACTION });
+  const route = await f.client.route(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION);
+  assert.equal(route.tool, "read");
+  assert.equal(route.fallbackReason, null);
+  assert.deepEqual(await f.client.propose(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION, [], route), EXTRACT_ACTION);
+  assert.deepEqual(chatInput(f.calls).chat.payload.format.properties.kind.enum, ["extract", "done"]);
+  const forbidden = { kind: "open_tab", snapshot_id: OBSERVATION.snapshot_id, target_id: "e2", reason: "Open the observed role" };
+  const g = fixture({ toolChoice: pick("read", ["read", "interact", "search"]), action: forbidden });
+  const readRoute = await g.client.route(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION);
+  await assert.rejects(g.client.propose(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION, [], readRoute), code("invalid_action"));
+  assert.deepEqual(chatInput(g.calls).chat.payload.format.properties.kind.enum, ["extract", "done"]);
+  assert.equal(g.calls.filter(call => call.path === ENDPOINTS.chat).length, 1);
+});
+
+for (const [invalid, expectedCode] of [
+  [{ kind: "evaluate", snapshot_id: OBSERVATION.snapshot_id, reason: "Invented tool" }, "invalid_action"],
+  [{ kind: "open_tab", snapshot_id: OBSERVATION.snapshot_id, target_id: "invented", reason: "Unobserved link" }, "unobserved_target"],
+  [{ kind: "switch_tab", snapshot_id: OBSERVATION.snapshot_id, tab_ref: "unrelated", reason: "Unobserved tab" }, "unobserved_tab"],
+  [{ kind: "switch_tab", snapshot_id: OBSERVATION.snapshot_id, tab_ref: "88", reason: "Raw Chrome ID" }, "unobserved_tab"],
+  [{ kind: "navigate", snapshot_id: OBSERVATION.snapshot_id, url: "javascript:alert(1)", reason: "Unsafe destination" }, "invalid_action"],
+  [{ kind: "open_tab", snapshot_id: OBSERVATION.snapshot_id, target_id: "e2", reason: "Unknown action field", script: "forged()" }, "invalid_action"],
+  [{ kind: "open_tab", snapshot_id: "old-observation", target_id: "e2", reason: "Stale observation" }, "stale_action"],
+]) {
+  test(`uncertain interact fallback retains ${expectedCode} validation for ${invalid.reason}`, async () => {
+    const { client, calls } = fixture({ toolChoice: uncertainTool("search"), action: invalid });
+    const route = await client.route(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION);
+    assert.equal(route.tool, "interact");
+    await assert.rejects(client.propose(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION, [], route), code(expectedCode));
+    assert.deepEqual(chatInput(calls).chat.payload.format.properties.target_id.enum, ["e1", "e2", null]);
+    assert.equal(calls.filter(call => call.path === ENDPOINTS.decisions).length, 1);
+    assert.equal(calls.filter(call => call.path === ENDPOINTS.chat).length, 1);
+  });
+}
+
+test("uncertain interaction routing leaves relevance judgment independent and does not grant approval", async () => {
+  const rejectedScore = DEFAULT_SETTINGS.minimumRelevance / 2;
+  const action = { kind: "open_tab", snapshot_id: OBSERVATION.snapshot_id, target_id: "e2", reason: "Inspect the employer detail" };
+  const { client, calls } = fixture({ toolChoice: uncertainTool("read"), action, judgment: { type: "noul", noul: rejectedScore } });
+  const route = await client.route(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION);
+  const proposed = await client.propose(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION, [], route);
+  const judgment = await client.judge(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION, proposed);
+  assert.equal(route.tool, "interact");
+  assert.equal(judgment.score, rejectedScore);
+  assert.ok(judgment.score < DEFAULT_SETTINGS.minimumRelevance);
+  assert.equal(Object.hasOwn(judgment, "approved"), false);
+  const reviewed = calls.filter(call => call.path === ENDPOINTS.decisions).find(call => call.payload.questions.useful);
+  assert.equal(reviewed.payload.state.target.id, "e2");
+  assert.equal(reviewed.payload.state.page.text, CAREER_INDEX_OBSERVATION.text.slice(0, LIMITS.decisionObservationChars));
+  const before = calls.length;
+  await assert.rejects(client.judge(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION, { ...proposed, target_id: "not-observed" }), code("unobserved_target"));
+  assert.equal(calls.length, before);
+  assert.equal(calls.filter(call => call.path === ENDPOINTS.chat).length, 1);
+});
+
+
+test("an uncertain model tier preserves every independently confident tool strategy", async () => {
+  for (const selectedModel of ["fast", "strong"]) {
+    for (const selectedTool of ["read", "interact", "search"]) {
+      const modelChoice = pick(selectedModel, ["fast", "strong"], DEFAULT_SETTINGS.routeConfidence / 2);
+      const toolChoice = pick(selectedTool, ["read", "interact", "search"]);
+      const { client } = fixture({ modelChoice, toolChoice });
+      const route = await client.route(CAREER_RESEARCH_GOAL, CAREER_INDEX_OBSERVATION);
+      assert.equal(route.model, TEST_SETTINGS.strongModel);
+      assert.equal(route.modelRole, "strong");
+      assert.equal(route.tool, selectedTool);
+      assert.equal(route.confidence, modelChoice.confidence);
+      assert.match(route.fallbackReason, /Model selection was uncertain/);
+      assert.equal(route.fallbackReason.includes("Tool selection was uncertain"), false);
+    }
+  }
+});

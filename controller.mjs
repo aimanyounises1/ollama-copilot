@@ -270,6 +270,7 @@ export class AgentRun {
         guard();
         const action = validateAction(await models.propose.invoke({ goal: state.goal, observation: state.observation, history: clone(this._state.actions), route: state.modelRoute }, options)); guard();
         validateObservedAction(action, state.observation);
+        this._note(`Planner proposal: ${action.kind}; reason: ${action.reason || "No reason supplied."}`);
         return { action };
       },
       judge: async state => {
@@ -282,6 +283,7 @@ export class AgentRun {
         this._state.actions.push(entry);
         if (approved) { this._pending = entry; this._dispatched = false; }
         else {
+          this._note(`Rejected ${state.action.kind}; not executed.`);
           this._state.status = "paused";
           this._state.error = "The proposed action did not meet the decision threshold. Review the task and start again.";
           this._note(this._state.error);

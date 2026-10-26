@@ -58,6 +58,31 @@ test("low judgment pauses without dispatching or claiming evidence", async () =>
   assert.ok(!f.calls.some(call => call.startsWith("execute:")));
 });
 
+for (const kind of ["type", "search"]) test(`rejected ${kind} identifies the planner proposal without logging raw input`, async () => {
+  const f = fixture({ score: 0.48 });
+  const hiddenInput = "raw-input-must-not-appear-in-activity";
+  const reason = "Inspect public role details before claiming a matching job";
+  f.client.route = async () => ({ model: f.settings.fastModel, modelRole: "fast", tool: kind === "search" ? "search" : "interact", confidence: 0.05, durationMs: 1, fallbackReason: "Tool selection was uncertain; use the interact strategy with observed controls." });
+  f.client.propose = async (goal, observation) => ({ kind, snapshot_id: observation.snapshot_id, reason,
+    ...(kind === "type" ? { target_id: "e0", text: hiddenInput } : { query: hiddenInput }) });
+  const state = await f.run.start("Find a suitable public role");
+  const activity = state.activity.map(entry => entry.message);
+  assert.equal(state.status, "paused");
+  assert.equal(state.actions[0].status, "paused");
+  assert.equal(state.actions[0].score, 0.48);
+  assert.equal(f.settings.minimumRelevance, 0.55);
+  assert.ok(activity.includes(`Planner proposal: ${kind}; reason: ${reason}`));
+  assert.ok(activity.includes(`Rejected ${kind}; not executed.`));
+  assert.ok(activity.includes("Action judgment: 0.48; minimum 0.55."));
+  assert.ok(activity.every(message => message.length <= CAPTURE_LIMITS.activityChars && !message.includes(hiddenInput)));
+  assert.ok(!activity.some(message => /judge reason|decision model reason/i.test(message)));
+  assert.ok(!f.calls.some(call => call.startsWith("execute:")));
+  assert.equal(state.sources.length, 0);
+  assert.equal(f.run.canContinue, false);
+  await assert.rejects(f.run.continueAfterPermission(), error => error.code === "not_resumable");
+});
+
+
 test("Stop during a pending planner prevents judgment and execution", { timeout: TEST_TIMEOUT_MS }, async () => {
   const f = fixture(); const entered = deferred(); const release = deferred();
   f.client.propose = async (goal, observation) => { f.calls.push("propose"); entered.resolve(); return { ...await release.promise, snapshot_id: observation.snapshot_id }; };
