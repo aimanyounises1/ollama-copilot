@@ -1,12 +1,14 @@
 /** A bounded, checkpointed browser task. Models advise; the driver owns execution policy. */
 import { LIMITS, validateSettings } from "./config.mjs";
-import { validateAction } from "./model-client.mjs";
+import { validateAction, validateObservedAction, validateTaskTabs } from "./model-client.mjs";
 import { safePublicUrl } from "./policy.mjs";
+import { createBrowserTaskGraph, browserGraphRecursionLimit } from "./agent-graph.mjs";
+import { createBrowserActionTool, createModelRunnables } from "./agent-tools.mjs";
 
 export const CAPTURE_LIMITS = Object.freeze({ maxChars: 8000, maxSources: 20, quoteChars: 1600, maxActivity: 80, activityChars: 400 });
 export const RUN_STATUSES = Object.freeze(["idle", "running", "stopping", "stopped", "completed", "paused", "failed", "limit_reached", "interrupted"]);
 const ACTIVE = new Set(["running", "stopping"]);
-const ACTION_FIELDS = Object.freeze(["kind", "snapshot_id", "target_id", "url", "text", "key", "query", "reason"]);
+const ACTION_FIELDS = Object.freeze(["kind", "snapshot_id", "target_id", "tab_ref", "url", "text", "key", "query", "reason"]);
 const ACTION_STATUSES = new Set(["pending", "executed", "unconfirmed", "cancelled", "paused"]);
 const TOOL_STRATEGIES = new Set(["read", "interact", "search"]);
 const SAFE_ERROR_NAMES = new Set(["ModelClientError", "BrowserDriverError", "AgentRunError"]);
@@ -60,15 +62,15 @@ function safeRoute(value, settings = null) {
   if (settings && ![settings.fastModel, settings.strongModel].includes(route.model)) throw new AgentRunError("invalid_route", "The decision model selected an unconfigured LLM.");
   return route;
 }
-function safeObservation(value) {
+function safeObservation(value, maximumTabs) {
   if (!plain(value) || !Array.isArray(value.elements) || value.elements.length > LIMITS.maxControls) throw new AgentRunError("invalid_observation", "The browser returned an invalid observation.");
-  return { ...value, snapshot_id: text(value.snapshot_id, LIMITS.maxSnapshotChars), url: sourceUrl(value.url), title: pageTitle(value.title), text: text(value.text, LIMITS.maxSourceChars, true) };
+  return { snapshot_id: text(value.snapshot_id, LIMITS.maxSnapshotChars), url: sourceUrl(value.url), title: pageTitle(value.title), text: text(value.text, LIMITS.maxSourceChars, true), elements: value.elements, ...validateTaskTabs(value, maximumTabs) };
 }
 function publicError(error) {
   return SAFE_ERROR_NAMES.has(error?.name) && typeof error?.code === "string" && typeof error?.message === "string" && error.message.length <= CAPTURE_LIMITS.activityChars ? error.message : "Ollama Copilot could not confirm a browser or model operation. Check the model connection and website access, then start again.";
 }
 function initialState(id, goal, maximum, now) {
-  return { id, goal, status: "idle", step: 0, maxSteps: maximum, tab: null, sources: [], actions: [], activity: [], route: null, report: "", error: null, startedAt: now, updatedAt: now };
+  return { id, goal, status: "idle", step: 0, maxSteps: maximum, tab: null, tabs: [], sources: [], actions: [], activity: [], route: null, report: "", error: null, startedAt: now, updatedAt: now };
 }
 
 /** Validate session data as data; a restored task is never an instruction to resume. */
@@ -86,7 +88,11 @@ export function restoreCheckpoint(value) {
     if (value.tab !== null) {
       if (!plain(value.tab) || !Number.isInteger(value.tab.tabId) || value.tab.tabId < 0) return null;
       state.tab = { tabId: value.tab.tabId, url: sourceUrl(value.tab.url), title: text(value.tab.title, LIMITS.maxTitleChars, true) };
-    }
+      if (value.tabs?.length || value.tab.tab_ref !== undefined) {
+        const metadata = validateTaskTabs({ tabs: value.tabs, tab_ref: value.tab.tab_ref, url: state.tab.url }, value.maxSteps + 1);
+        state.tab.tab_ref = metadata.tab_ref; state.tabs = metadata.tabs;
+      } else if (value.tabs !== undefined && (!Array.isArray(value.tabs) || value.tabs.length)) return null;
+    } else if (value.tabs !== undefined && (!Array.isArray(value.tabs) || value.tabs.length)) return null;
     const seen = new Set();
     state.sources = value.sources.map((source, index) => {
       if (!plain(source) || source.number !== index + 1 || !/^[a-f0-9]{64}$/.test(source.contentHash)) throw new AgentRunError("invalid_source", "The saved source capture is invalid.");
@@ -115,11 +121,11 @@ export class AgentRun {
     this.client = client; this.driver = driver; this.onUpdate = onUpdate; this.now = now; this.idFactory = idFactory;
     this._state = initialState(this.idFactory(), "", this.settings.maxSteps, this.now());
     this._state.decisionModel = this.settings.decisionModel;
-    this._abort = null; this._running = false; this._updates = Promise.resolve(); this._pending = null; this._dispatched = false;
+    this._abort = null; this._running = false; this._updates = Promise.resolve(); this._pending = null; this._dispatched = false; this.graph = null;
   }
   get state() { return clone(this._state); }
   get isRunning() { return this._running; }
-  _guard() { this._abort.signal.throwIfAborted(); }
+  _guard(signal = this._abort.signal) { signal.throwIfAborted(); }
   _note(message) {
     this._state.activity.push({ message: message.slice(0, CAPTURE_LIMITS.activityChars), at: this.now() });
     this._state.activity = this._state.activity.slice(-CAPTURE_LIMITS.maxActivity);
@@ -140,68 +146,130 @@ export class AgentRun {
     this._updates = this._updates.then(update, update);
     return this._updates;
   }
-  async _capture(observation, capturedAt) {
+  _updateTab(value) {
+    const metadata = validateTaskTabs(value, this.settings.maxSteps + 1);
+    this._state.tab = { ...this._state.tab, url: sourceUrl(value.url), title: pageTitle(value.title), ...(metadata ? { tab_ref: metadata.tab_ref } : {}) };
+    if (metadata) this._state.tabs = metadata.tabs;
+  }
+  async _capture(observation, capturedAt, signal) {
     const raw = observation.text.slice(0, CAPTURE_LIMITS.maxChars);
     if (!raw.trim()) throw new AgentRunError("empty_capture", "This page has no readable evidence to capture.");
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
-    this._guard();
+    this._guard(signal);
     const contentHash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
     if (this._state.sources.some(source => source.url === observation.url && source.contentHash === contentHash)) return;
     if (this._state.sources.length >= CAPTURE_LIMITS.maxSources) throw new AgentRunError("source_limit", "The source capture limit was reached. Collected evidence is retained.");
     this._state.sources.push({ number: this._state.sources.length + 1, url: observation.url, title: observation.title, text: raw, contentHash, capturedAt });
     this._note(`Captured source ${this._state.sources.length}: ${observation.title || observation.url}`);
   }
+  _workflow(signal) {
+    // The signal belongs to this invocation, even if this AgentRun is used again.
+    const guard = () => this._guard(signal);
+    const options = { signal, callbacks: [] };
+    const models = createModelRunnables(this.client, signal, guard);
+    const browserTool = createBrowserActionTool({ driver: this.driver, guard, onDispatch: () => { this._dispatched = true; } });
+    return createBrowserTaskGraph({
+      bind: async () => {
+        guard();
+        const tab = await this.driver.bindCurrentTab(); guard();
+        if (!plain(tab) || !Number.isInteger(tab.tabId)) throw new AgentRunError("invalid_tab", "The browser did not confirm the selected tab.");
+        this._state.tab = { tabId: tab.tabId }; this._updateTab(tab);
+        await this._publish(); guard();
+        return { step: 0, approved: false, finished: false };
+      },
+      observe: async state => {
+        guard();
+        const observation = safeObservation(await this.driver.observe(), this.settings.maxSteps + 1); guard();
+        const step = state.step + 1;
+        this._state.step = step; this._updateTab(observation);
+        this._note(`Observed ${observation.title || observation.url}`);
+        return { step, observation, capturedAt: this.now(), action: null, judgment: null, result: null, approved: false };
+      },
+      route: async state => {
+        guard();
+        const route = safeRoute(await models.route.invoke({ goal: state.goal, observation: state.observation }, options), this.settings); guard();
+        this._state.route = route;
+        this._note(`Decision route: ${route.model}; ${route.tool} strategy.`);
+        await this._publish(); guard();
+        return { modelRoute: route };
+      },
+      propose: async state => {
+        guard();
+        const action = validateAction(await models.propose.invoke({ goal: state.goal, observation: state.observation, history: clone(this._state.actions), route: state.modelRoute }, options)); guard();
+        validateObservedAction(action, state.observation);
+        return { action };
+      },
+      judge: async state => {
+        guard();
+        const judgment = await models.judge.invoke({ goal: state.goal, observation: state.observation, action: state.action }, options); guard();
+        if (!plain(judgment) || !finite(judgment.score, 1) || !finite(judgment.durationMs)) throw new AgentRunError("invalid_judgment", "The decision model returned an invalid action judgment.");
+        const approved = judgment.score >= this.settings.minimumRelevance;
+        this._note(`Action judgment: ${judgment.score.toFixed(2)}; minimum ${this.settings.minimumRelevance.toFixed(2)}.`);
+        const entry = { ...state.action, step: state.step, model: state.modelRoute.model, score: judgment.score, status: approved ? "pending" : "paused" };
+        this._state.actions.push(entry);
+        if (approved) { this._pending = entry; this._dispatched = false; }
+        else {
+          this._state.status = "paused";
+          this._state.error = "The proposed action did not meet the decision threshold. Review the task and start again.";
+          this._note(this._state.error);
+        }
+        return { judgment: { score: judgment.score, durationMs: judgment.durationMs }, approved };
+      },
+      prepare_action: async () => {
+        guard();
+        // The saved checkpoint is a dispatch barrier, not an eventual graph stream.
+        await this._publish(); guard();
+        return {};
+      },
+      execute: async state => {
+        guard();
+        validateObservedAction(state.action, state.observation);
+        const result = await browserTool.invoke({ action: state.action }, options); guard();
+        if (!plain(result) || result.status !== "executed") throw new AgentRunError("unconfirmed_action", "The browser did not confirm the action outcome.");
+        this._pending.status = "executed"; this._pending = null; this._dispatched = false;
+        if (["open_tab", "switch_tab"].includes(state.action.kind)) this._updateTab(result);
+        return { result };
+      },
+      capture: async state => {
+        guard();
+        if (["extract", "done"].includes(state.action.kind)) {
+          if (sourceUrl(state.result.url) !== state.observation.url) throw new AgentRunError("changed_capture", "The page changed before evidence capture could be confirmed.");
+          await this._capture(state.observation, state.capturedAt, signal); guard();
+        }
+        this._note(`${state.action.kind}: ${state.action.reason || "Browser action confirmed."}`);
+        await this._publish(); guard();
+        if (state.action.kind === "done") {
+          this._state.status = "completed"; this._note("The task finished with its captured evidence.");
+          return { finished: true };
+        }
+        if (state.step >= this.settings.maxSteps) {
+          this._state.status = "limit_reached";
+          this._state.error = "The step limit was reached. Collected evidence is retained.";
+          this._note(this._state.error);
+          return { finished: true };
+        }
+        return { finished: false };
+      },
+      finalize: () => { guard(); return { finished: true }; },
+    });
+  }
   async start(goal) {
     if (this._running) throw new AgentRunError("already_running", "Stop the current task before starting another.");
     goal = text(goal, LIMITS.maxGoalChars).trim();
     this._abort = new AbortController(); this._running = true; this._pending = null; this._dispatched = false;
+    const signal = this._abort.signal;
     this._state = initialState(this.idFactory(), goal, this.settings.maxSteps, this.now());
     this._state.decisionModel = this.settings.decisionModel;
     this._state.status = "running";
     this._note("Starting on the explicitly selected tab.");
     try {
-      await this._publish(); this._guard();
-      const tab = await this.driver.bindCurrentTab(); this._guard();
-      if (!plain(tab) || !Number.isInteger(tab.tabId)) throw new AgentRunError("invalid_tab", "The browser did not confirm the selected tab.");
-      this._state.tab = { tabId: tab.tabId, url: sourceUrl(tab.url), title: pageTitle(tab.title) };
-      await this._publish();
-      for (let index = 0; index < this.settings.maxSteps; index += 1) {
-        this._guard(); this._state.step = index + 1;
-        const observation = safeObservation(await this.driver.observe()); this._guard();
-        const capturedAt = this.now();
-        this._note(`Observed ${observation.title || observation.url}`);
-        this._state.route = safeRoute(await this.client.route(goal, observation, this._abort.signal), this.settings); this._guard();
-        this._note(`Decision route: ${this._state.route.model}; ${this._state.route.tool} strategy.`);
-        await this._publish(); this._guard();
-        const action = validateAction(await this.client.propose(goal, observation, this._state.actions, this._state.route, this._abort.signal)); this._guard();
-        if (action.snapshot_id !== observation.snapshot_id) throw new AgentRunError("stale_action", "The proposed action does not match the observed page.");
-        const judgment = await this.client.judge(goal, observation, action, this._abort.signal); this._guard();
-        if (!plain(judgment) || !finite(judgment.score, 1) || !finite(judgment.durationMs)) throw new AgentRunError("invalid_judgment", "The decision model returned an invalid action judgment.");
-        this._note(`Action judgment: ${judgment.score.toFixed(2)}; minimum ${this.settings.minimumRelevance.toFixed(2)}.`);
-        const entry = { ...action, step: index + 1, model: this._state.route.model, score: judgment.score, status: judgment.score >= this.settings.minimumRelevance ? "pending" : "paused" };
-        this._state.actions.push(entry);
-        if (entry.status === "paused") {
-          this._state.status = "paused"; this._state.error = "The proposed action did not meet the decision threshold. Review the task and start again.";
-          this._note(this._state.error); break;
-        }
-        this._pending = entry; this._dispatched = false;
-        await this._publish(); this._guard();
-        this._dispatched = true;
-        const result = await this.driver.execute(action); this._guard();
-        if (!plain(result) || result.status !== "executed") throw new AgentRunError("unconfirmed_action", "The browser did not confirm the action outcome.");
-        entry.status = "executed"; this._pending = null; this._dispatched = false;
-        if (["extract", "done"].includes(action.kind)) {
-          if (sourceUrl(result.url) !== observation.url) throw new AgentRunError("changed_capture", "The page changed before evidence capture could be confirmed.");
-          await this._capture(observation, capturedAt); this._guard();
-        }
-        this._note(`${action.kind}: ${action.reason || "Browser action confirmed."}`);
-        await this._publish(); this._guard();
-        if (action.kind === "done") { this._state.status = "completed"; this._note("The task finished with its captured evidence."); break; }
-      }
-      if (this._state.status === "running") { this._state.status = "limit_reached"; this._state.error = "The step limit was reached. Collected evidence is retained."; this._note(this._state.error); }
+      await this._publish(); this._guard(signal);
+      this.graph = this._workflow(signal);
+      await this.graph.invoke({ goal, step: 0, approved: false, finished: false }, { signal, callbacks: [], recursionLimit: browserGraphRecursionLimit(this.settings.maxSteps) });
+      this._guard(signal);
     } catch (error) {
       if (this._pending) this._pending.status = this._dispatched ? "unconfirmed" : "cancelled";
-      if (this._abort.signal.aborted || error?.name === "AbortError") { this._state.status = "stopped"; this._state.error = null; this._note("Stopped. No further actions will run."); }
+      if (signal.aborted || error?.name === "AbortError") { this._state.status = "stopped"; this._state.error = null; this._note("Stopped. No further actions will run."); }
       else { this._state.status = error?.code === "source_limit" ? "limit_reached" : "failed"; this._state.error = publicError(error); this._note(this._state.error); }
     } finally {
       try { await this.driver.cancel(); }

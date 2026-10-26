@@ -193,3 +193,62 @@ test("the user-selected Qwen3.8 handles both default planning tiers", () => {
   assert.equal(defaults.fastModel, defaults.strongModel);
   assert.equal(defaults.fastModel, "qwen3.8:latest");
 });
+
+
+const TASK_OBSERVATION = Object.freeze({ ...OBSERVATION, tab_ref: "task-search", tabs: [
+  { ref: "task-search", title: "Research", url: PAGE_URL, active: true, tabId: 77, windowId: 12 },
+  { ref: "task-detail", title: "Observed role", url: "https://fixture.example/result", active: false, tabId: 88 },
+] });
+
+test("tab actions use observed controls and opaque refs without exposing Chrome IDs", async () => {
+  const open = { kind: "open_tab", snapshot_id: OBSERVATION.snapshot_id, target_id: "e2", reason: "Open the observed role" };
+  const opened = fixture({ action: open });
+  assert.deepEqual(await opened.client.propose("Read this role in a new tab", TASK_OBSERVATION, [], ROUTE), open);
+  const chat = opened.calls.find(call => call.path === ENDPOINTS.chat).payload;
+  assert.ok(chat.format.properties.kind.enum.includes("open_tab"));
+  assert.deepEqual(chat.format.properties.tab_ref.enum, ["task-detail", null]);
+  const sent = JSON.parse(chat.messages[1].content).observation;
+  assert.equal(sent.tab_ref, "task-search");
+  assert.deepEqual(Object.keys(sent.tabs[0]), ["ref", "title", "url", "active"]);
+  assert.equal(Object.hasOwn(sent.tabs[0], "tabId"), false);
+  assert.equal(Object.hasOwn(sent, "document_id"), false);
+  const action = { kind: "switch_tab", snapshot_id: OBSERVATION.snapshot_id, tab_ref: "task-detail", reason: "Read the already observed detail tab" };
+  const switched = fixture({ action });
+  assert.deepEqual(await switched.client.propose("Read the detail tab", TASK_OBSERVATION, [], ROUTE), action);
+  await switched.client.judge("Read the detail tab", TASK_OBSERVATION, action);
+  const decision = switched.calls.find(call => call.path === ENDPOINTS.decisions).payload;
+  assert.equal(decision.state.tab_target.ref, "task-detail");
+  assert.equal(Object.hasOwn(decision.state.tab_target, "tabId"), false);
+});
+
+test("invented, active or raw tab references and non-anchor opens fail before review", async () => {
+  for (const tab_ref of ["unobserved", "task-search", "88"]) {
+    const action = { kind: "switch_tab", snapshot_id: OBSERVATION.snapshot_id, tab_ref, reason: "Switch" };
+    await assert.rejects(fixture({ action }).client.propose("Read", TASK_OBSERVATION, [], ROUTE), code("unobserved_tab"));
+    const judged = fixture();
+    await assert.rejects(judged.client.judge("Read", TASK_OBSERVATION, action), code("unobserved_tab"));
+    assert.equal(judged.calls.length, 0);
+  }
+  const action = { kind: "open_tab", snapshot_id: OBSERVATION.snapshot_id, target_id: "e1", reason: "Open" };
+  await assert.rejects(fixture({ action }).client.propose("Read", TASK_OBSERVATION, [], ROUTE), code("unobserved_target"));
+  await assert.rejects(fixture({ action: { ...action, target_id: "e2", url: PAGE_URL } }).client.propose("Read", TASK_OBSERVATION, [], ROUTE), code("invalid_action"));
+  assert.throws(() => validateAction({ kind: "done", snapshot_id: "one", tab_ref: "task-detail", reason: "Finish" }), code("invalid_action"));
+});
+
+test("task tab catalogs reject duplicates, unknown active refs and oversized registries", async () => {
+  const cases = [
+    { ...TASK_OBSERVATION, tab_ref: "unknown" },
+    { ...TASK_OBSERVATION, tabs: TASK_OBSERVATION.tabs.map(tab => ({ ...tab, active: true })) },
+    { ...TASK_OBSERVATION, tabs: TASK_OBSERVATION.tabs.map(tab => ({ ...tab, ref: "task-search" })) },
+    { ...TASK_OBSERVATION, tabs: undefined },
+    { ...TASK_OBSERVATION, tabs: [{ ...TASK_OBSERVATION.tabs[0], url: "https://fixture.example/elsewhere" }] },
+    { ...TASK_OBSERVATION, tabs: [...TASK_OBSERVATION.tabs, { ref: "task-third", title: "Third", url: PAGE_URL, active: false }] },
+  ];
+  for (const observation of cases) {
+    const { client, calls } = fixture({ settings: { maxSteps: 1 } });
+    await assert.rejects(client.route("Read", observation), code("invalid_input"));
+    assert.ok(!calls.some(call => [ENDPOINTS.chat, ENDPOINTS.decisions].includes(call.path)));
+  }
+  const action = { kind: "switch_tab", snapshot_id: OBSERVATION.snapshot_id, tab_ref: "task-detail", reason: "Switch" };
+  await assert.rejects(fixture({ action }).client.propose("Read", OBSERVATION, [], ROUTE), code("unobserved_tab"));
+});

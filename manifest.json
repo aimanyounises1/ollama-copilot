@@ -4,11 +4,30 @@
   "version": "0.1.0",
   "description": "Control your browser with local Ollama models.",
   "minimum_chrome_version": "116",
-  "permissions": ["sidePanel", "activeTab", "scripting", "storage"],
-  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
-  "optional_host_permissions": ["http://*/*", "https://*/*"],
-  "background": {"service_worker": "background.js"},
-  "action": {"default_title": "Open Ollama Copilot"},
-  "side_panel": {"default_path": "sidepanel.html"},
-  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"}
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open Ollama Copilot"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:*"
+  }
 }

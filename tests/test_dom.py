@@ -29,7 +29,7 @@ CHROME_TRANSPORT = r"""
      emit: (...args) => { for (const fn of [...handlers]) fn(...args); } };
  };
  const connected = event(), updated = event();
- const fixture = window.fixture = { activeTabId: 7, documentId: 'document-A', loading: false,
+ const fixture = window.fixture = { activeTabId: 7, windowId: 11, nextTabId: 8, tabData: new Map(), createdTabs: [], activatedTabs: [], documentId: 'document-A', loading: false,
    lastConnect: null, permissionOrigins: [], typed: [], updated, connections: [], deferAction: false, queryUrl: null, urlVisible: true };
  fixture.connect = () => {
    let alive = true;
@@ -53,10 +53,21 @@ CHROME_TRANSPORT = r"""
      const id = crypto.randomUUID(); pending.set(id, {resolve, reject}); port.postMessage({id, op, ...options});
    });
  };
+ fixture.tab = id => fixture.tabData.get(id) || {id, windowId: fixture.windowId,
+   url: fixture.urlVisible ? fixture.queryUrl || location.href : undefined,
+   title: document.title, status: fixture.loading ? 'loading' : 'complete'};
  window.chrome = {
    runtime: { id: 'fixture-extension', getURL: path => 'chrome-extension://fixture-extension/' + path, onConnect: connected, lastError: null },
-   tabs: { query: async () => [{id: fixture.activeTabId, url: fixture.urlVisible ? fixture.queryUrl || location.href : undefined, title: document.title, status: fixture.loading ? 'loading' : 'complete'}],
-     get: async id => ({id, url: fixture.urlVisible ? fixture.queryUrl || location.href : undefined, status: fixture.loading ? 'loading' : 'complete'}), onUpdated: updated,
+   tabs: { query: async () => [fixture.tab(fixture.activeTabId)],
+     get: async id => fixture.tab(id), onUpdated: updated,
+     create: async options => {
+       fixture.createdTabs.push(options);
+       const tab = {id: fixture.nextTabId++, windowId: options.windowId, url: options.url, title: 'New public reading tab', status: 'complete'};
+       fixture.tabData.set(tab.id, tab); fixture.activeTabId = tab.id;
+       if (fixture.deferCreate) return new Promise(resolve => { fixture.confirmCreate = () => resolve(tab); });
+       return tab;
+     },
+     update: async (id, options) => { fixture.activatedTabs.push({id, ...options}); fixture.activeTabId = id; if (fixture.deferUpdate) return new Promise(resolve => { fixture.confirmUpdate = () => resolve(fixture.tab(id)); }); return fixture.tab(id); },
      connect: (id, options) => { fixture.lastConnect = {id, ...options}; return fixture.connect(); } },
    scripting: { executeScript: async options => { fixture.lastInjection = options; return [{ frameId: 0, documentId: fixture.documentId }]; } },
    permissions: { request: async options => { fixture.permissionOrigins.push(options.origins); return true; } },
@@ -213,7 +224,7 @@ def test_new_observation_invalidates_previous_action(actor):
 def load_driver(page):
     page.evaluate("""async () => {
       const {BrowserDriver} = await import('/extension/browser-driver.mjs');
-      window.driver = new BrowserDriver({typingDelayMs:0,requestTimeoutMs:30000,searchUrl:'https://search-fixture.example/search',searchParameter:'q'});
+      window.driver = new BrowserDriver({maxSteps:12,typingDelayMs:0,requestTimeoutMs:30000,searchUrl:'https://search-fixture.example/search',searchParameter:'q'});
       await driver.bindCurrentTab();
     }""")
 
@@ -401,7 +412,7 @@ def test_driver_does_not_confirm_an_action_when_its_document_disconnects_before_
 def test_unpacked_content_actor_supports_insecure_http_without_random_uuid(tmp_path, playwright_runtime):
     """Real isolated-world actor, with only this exact synthetic host granted in the test copy."""
     fixture_home = "http://crypto-fixture.example/"
-    unpacked = shutil.copytree(ROOT, tmp_path / "http-extension", ignore=shutil.ignore_patterns("tests", "__pycache__"))
+    unpacked = shutil.copytree(ROOT, tmp_path / "http-extension", ignore=shutil.ignore_patterns("tests", "node_modules", "__pycache__", ".pytest_cache", ".git", ".venv", ".test-venv"))
     manifest_path = unpacked / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["host_permissions"].append(fixture_home + "*")
@@ -471,3 +482,154 @@ def test_unpacked_content_actor_supports_insecure_http_without_random_uuid(tmp_p
         assert target.locator("#query").input_value() == "HTTP research"
     finally:
         context.close()
+
+
+def test_open_tab_resolves_a_fresh_reading_anchor_without_page_navigation(actor):
+    snapshot = observation(actor)
+    result = execute(actor, action_for(snapshot, "open_tab", "Documentation"))
+    assert result["destination"] == HOME + "guide"
+    assert result["url"] == HOME
+    assert "navigation" not in result
+    assert actor.url == HOME
+    assert failure(actor, action_for(snapshot, "open_tab", "Documentation"))["code"] == "stale_snapshot"
+
+
+def test_open_tab_checks_current_anchor_fingerprint_and_download_policy(actor):
+    first = observation(actor)
+    actor.evaluate("() => document.querySelector('#docs').href = '/changed'")
+    assert failure(actor, action_for(first, "open_tab", "Documentation"))["code"] == "changed_control"
+    actor.evaluate("() => { document.querySelector('#docs').href = '/guide'; document.querySelector('#docs').setAttribute('download',''); }")
+    current = observation(actor)
+    assert failure(actor, action_for(current, "open_tab", "Documentation"))["code"] == "manual_review"
+    assert actor.url == HOME
+
+
+def test_driver_opens_only_a_task_tab_and_switches_only_observed_owned_refs(actor):
+    # The native tab API transport is simulated; the packaged actor still resolves
+    # the actual observed DOM anchor. The unpacked workflow covers separate real pages.
+    actor.evaluate("() => document.querySelector('#docs').href = location.href")
+    load_driver(actor)
+    first = actor.evaluate("() => driver.observe()")
+    initial_ref = first["tab_ref"]
+    assert first["tabs"] == [{"ref": initial_ref, "title": "Public fixture", "url": HOME, "active": True}]
+    opened = actor.evaluate("action => driver.execute(action)", action_for(first, "open_tab", "Documentation"))
+    assert opened["status"] == "executed"
+    assert opened["tab_ref"] != initial_ref
+    assert actor.evaluate("() => fixture.createdTabs") == [{"url": HOME, "active": True, "windowId": 11, "openerTabId": 7}]
+    assert actor.evaluate("() => driver.observation") is None
+    second = actor.evaluate("() => driver.observe()")
+    assert len(second["tabs"]) == 2
+    assert not any("id" in tab or "tabId" in tab for tab in second["tabs"])
+    unknown = action_for(second, "switch_tab", tab_ref="other-user-tab")
+    assert actor.evaluate("async action => { try { await driver.execute(action); } catch(e) { return e.code; } }", unknown) == "unknown_tab"
+    same = action_for(second, "switch_tab", tab_ref=second["tab_ref"])
+    assert actor.evaluate("async action => { try { await driver.execute(action); } catch(e) { return e.code; } }", same) == "unknown_tab"
+    assert actor.evaluate("() => fixture.activatedTabs") == []
+    switched = actor.evaluate("action => driver.execute(action)", action_for(second, "switch_tab", tab_ref=initial_ref))
+    assert switched["tab_ref"] == initial_ref
+    assert actor.evaluate("() => fixture.activatedTabs") == [{"id": 7, "active": True}]
+    assert actor.evaluate("() => driver.observation") is None
+    third = actor.evaluate("() => driver.observe()")
+    assert third["tab_ref"] == initial_ref
+    assert third["snapshot_id"] != first["snapshot_id"]
+    actor.evaluate("() => { fixture.activeTabId=99; }")
+    assert actor.evaluate("async () => { try { await driver.observe(); } catch(e) { return e.code; } }") == "tab_changed"
+
+
+def test_driver_retains_independent_history_and_rejects_background_document_replacement(actor):
+    actor.evaluate("() => document.querySelector('#docs').href = location.href")
+    load_driver(actor)
+    first = actor.evaluate("() => driver.observe()")
+    initial_ref = first["tab_ref"]
+    actor.evaluate("() => driver.history.unshift(location.href + 'earlier')")
+    actor.evaluate("action => driver.execute(action)", action_for(first, "open_tab", "Documentation"))
+    second = actor.evaluate("() => driver.observe()")
+    assert actor.evaluate("() => driver.history") == [HOME]
+    assert actor.evaluate("async action => { try { await driver.execute(action); } catch(e) { return e.code; } }", action_for(second, "back")) == "no_history"
+    actor.evaluate("action => driver.execute(action)", action_for(second, "switch_tab", tab_ref=initial_ref))
+    assert actor.evaluate("() => driver.history") == [HOME + "earlier", HOME]
+    actor.evaluate("() => { fixture.documentId='replaced-while-background'; }")
+    assert actor.evaluate("async () => { try { await driver.observe(); } catch(e) { return e.code; } }") == "stale_snapshot"
+
+
+def test_stop_before_link_resolution_prevents_native_tab_creation(actor):
+    load_driver(actor)
+    snapshot = actor.evaluate("() => driver.observe()")
+    actor.evaluate("action => { fixture.deferAction=true; window.tabAction=driver.execute(action).catch(e=>e.name); }", action_for(snapshot, "open_tab", "Documentation"))
+    actor.wait_for_function("() => Boolean(fixture.pendingAction)")
+    actor.evaluate("() => driver.cancel()")
+    assert actor.evaluate("() => tabAction") == "AbortError"
+    assert actor.evaluate("() => fixture.createdTabs") == []
+
+
+def test_stop_during_committed_tab_creation_never_adopts_or_observes_the_tab(actor):
+    load_driver(actor)
+    snapshot = actor.evaluate("() => driver.observe()")
+    initial_ref = snapshot["tab_ref"]
+    actor.evaluate("action => { fixture.deferCreate=true; window.tabAction=driver.execute(action).catch(e=>e.name); }", action_for(snapshot, "open_tab", "Documentation"))
+    actor.wait_for_function("() => Boolean(fixture.confirmCreate)")
+    actor.evaluate("() => { driver.cancel(); fixture.confirmCreate(); }")
+    assert actor.evaluate("() => tabAction") == "AbortError"
+    assert actor.evaluate("() => driver.tabRef") == initial_ref
+    assert actor.evaluate("() => driver.taskTabs.size") == 1
+    assert actor.evaluate("() => fixture.createdTabs.length") == 1
+    assert actor.evaluate("() => fixture.lastInjection.target.tabId") == 7
+
+
+def test_new_tab_grant_keeps_only_its_known_destination_origin(actor):
+    load_driver(actor)
+    snapshot = actor.evaluate("() => driver.observe()")
+    actor.evaluate("action => driver.execute(action)", action_for(snapshot, "open_tab", "Documentation"))
+    actor.evaluate("() => { fixture.tabData.get(fixture.activeTabId).url=undefined; }")
+    assert actor.evaluate("async () => { try { await driver.observe(); } catch(e) { return e.code; } }") == "site_access_required"
+    assert actor.evaluate("() => driver.grantCurrentSite()") is True
+    assert actor.evaluate("() => fixture.permissionOrigins") == [["https://browser-fixture.example/*"]]
+
+
+@pytest.mark.parametrize("has_site_access", [True, False])
+def test_new_tab_waits_for_complete_metadata_before_any_injection(actor, has_site_access):
+    actor.evaluate("() => document.querySelector('#docs').href = location.href")
+    load_driver(actor)
+    first = actor.evaluate("() => driver.observe()")
+    actor.evaluate("action => driver.execute(action)", action_for(first, "open_tab", "Documentation"))
+    actor.evaluate("() => { const tab=fixture.tabData.get(fixture.activeTabId); tab.url=undefined; tab.status='loading'; window.tabObservation=driver.observe().then(result=>({result}),error=>({code:error.code})); }")
+    actor.wait_for_function("() => fixture.updated.handlers.size === 1")
+    assert actor.evaluate("() => fixture.lastInjection.target.tabId") == 7
+    actor.evaluate("hasAccess => { const tab=fixture.tabData.get(fixture.activeTabId); tab.url=hasAccess ? location.href : undefined; tab.status='complete'; fixture.updated.emit(tab.id,{status:'complete'}); }", has_site_access)
+    outcome = actor.evaluate("() => tabObservation")
+    if has_site_access:
+        assert outcome["result"]["url"] == HOME
+        assert actor.evaluate("() => fixture.lastInjection.target.tabId") == 8
+    else:
+        assert outcome == {"code": "site_access_required"}
+        assert actor.evaluate("() => fixture.lastInjection.target.tabId") == 7
+    assert actor.evaluate("() => fixture.updated.handlers.size") == 0
+
+
+def test_tab_budget_and_moved_registry_tab_cannot_dispatch_an_extra_browser_action(actor):
+    actor.evaluate("() => document.querySelector('#docs').href = location.href")
+    load_driver(actor)
+    actor.evaluate("() => { driver.settings.maxSteps=1; }")
+    first = actor.evaluate("() => driver.observe()")
+    actor.evaluate("action => driver.execute(action)", action_for(first, "open_tab", "Documentation"))
+    second = actor.evaluate("() => driver.observe()")
+    assert actor.evaluate("async action => { try { await driver.execute(action); } catch(e) { return e.code; } }", action_for(second, "open_tab", "Documentation")) == "tab_limit"
+    assert actor.evaluate("() => fixture.createdTabs.length") == 1
+    actor.evaluate("() => fixture.tabData.set(7,{id:7,windowId:12,url:location.href,status:'complete'})")
+    assert actor.evaluate("async action => { try { await driver.execute(action); } catch(e) { return e.code; } }", action_for(second, "switch_tab", tab_ref=first["tab_ref"])) == "tab_changed"
+    assert actor.evaluate("() => fixture.activatedTabs") == []
+
+
+def test_stop_during_committed_tab_switch_does_not_adopt_or_observe_the_destination(actor):
+    actor.evaluate("() => document.querySelector('#docs').href = location.href")
+    load_driver(actor)
+    first = actor.evaluate("() => driver.observe()")
+    actor.evaluate("action => driver.execute(action)", action_for(first, "open_tab", "Documentation"))
+    second = actor.evaluate("() => driver.observe()")
+    actor.evaluate("action => { fixture.deferUpdate=true; window.tabSwitch=driver.execute(action).catch(e=>e.name); }", action_for(second, "switch_tab", tab_ref=first["tab_ref"]))
+    actor.wait_for_function("() => Boolean(fixture.confirmUpdate)")
+    actor.evaluate("() => { driver.cancel(); fixture.confirmUpdate(); }")
+    assert actor.evaluate("() => tabSwitch") == "AbortError"
+    assert actor.evaluate("() => driver.tabRef") == second["tab_ref"]
+    assert actor.evaluate("() => fixture.lastInjection.target.tabId") == 8
+    assert actor.evaluate("() => fixture.activatedTabs") == [{"id": 7, "active": True}]

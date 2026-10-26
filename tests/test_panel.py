@@ -1,6 +1,7 @@
 """Panel bootstrap, safe restore and permission recovery in isolated Chromium."""
 
 import json
+import subprocess
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -64,8 +65,32 @@ def saved_checkpoint():
     }
 
 
+@pytest.fixture(scope="session")
+def panel_bundle():
+    """Compile the real panel with deterministic test adapters outside production code."""
+    entry = (
+        'import { ModelClient } from "./model-client.mjs";\n'
+        'import { BrowserDriver, BrowserDriverError } from "./browser-driver.mjs";\n'
+        + MODEL_FACADE + DRIVER_FACADE + '\nawait import("./panel.mjs");\n'
+    )
+    compiler = """
+import {buildPanelBundle} from './build.mjs';
+let contents = '';
+for await (const chunk of process.stdin) contents += chunk;
+const result = await buildPanelBundle({contents});
+const artifact = result.outputFiles.find(output => output.path.endsWith('panel.js'));
+if (!artifact) throw new Error('The panel fixture bundle was not produced.');
+process.stdout.write(artifact.text);
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", compiler], cwd=EXTENSION,
+        input=entry, text=True, capture_output=True, check=True,
+    )
+    return result.stdout
+
+
 @pytest.fixture
-def panel():
+def panel(panel_bundle):
     """All traffic stays in a local response facade; no user profile or website is touched."""
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -96,7 +121,7 @@ window.chrome = {
   runtime:{id:'fixture-extension'},
   storage:{local:storageArea('local'),session:storageArea('session')},
   tabs:{async query() {
-    const tab = {id:7,title:'Role research',status:'complete'};
+    const tab = {id:7,windowId:1,title:'Role research',status:'complete'};
     if (window.__fixture.activeUrl) tab.url = window.__fixture.activeUrl;
     return [tab];
   }},
@@ -113,14 +138,13 @@ window.chrome = {
                 if filename == "favicon.ico":
                     route.fulfill(status=204)
                     return
-                path = EXTENSION / filename
-                if path.parent != EXTENSION or not path.is_file():
-                    raise AssertionError(f"Unexpected panel asset: {filename}")
-                content = path.read_text()
-                if filename == "model-client.mjs":
-                    content += MODEL_FACADE
-                elif filename == "browser-driver.mjs":
-                    content += DRIVER_FACADE
+                if filename == "dist/panel.js":
+                    content = panel_bundle
+                else:
+                    path = EXTENSION / filename
+                    if path.parent != EXTENSION or not path.is_file():
+                        raise AssertionError(f"Unexpected panel asset: {filename}")
+                    content = path.read_text()
                 kind = "text/html" if filename.endswith(".html") else "text/css" if filename.endswith(".css") else "text/javascript"
                 route.fulfill(body=content, content_type=kind)
 

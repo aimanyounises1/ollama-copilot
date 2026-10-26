@@ -11,6 +11,8 @@ jobs:
         with:
           node-version: "26.3.0"
           package-manager-cache: false
+      - run: npm ci
+      - run: npm run build
       - run: npm test
       - run: npm run check
       - run: python3 -m venv .test-venv

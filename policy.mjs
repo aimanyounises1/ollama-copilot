@@ -10,8 +10,8 @@ export const MAX_ACTION_REASON = 240;
 export const PORT_TIMEOUT_MS = 30000;
 export const NAVIGATION_TIMEOUT_MS = 30000;
 export const SENSITIVE = /\b(password|passcode|otp|credit|card|billing|payment|checkout|purchase|buy|pay|delete|remove|unsubscribe|subscribe|sign[ -]?in|log[ -]?in|logout|register|send|upload|accept|agree|email|address|phone|apply|post|comment|message|publish|save)\b|\b(?:close|deactivate|disable|terminate|cancel|erase|open|create)[\s_-]+(?:(?:my|your|this|the|new|bank)[\s_-]+)*(?:account|accounts|membership|subscription|profile)\b|\b(?:account|membership|subscription|profile)[\s_-]+(?:closure|deactivation|termination|cancellation|deletion)\b/i;
-const KINDS = new Set(["navigate", "click", "type", "press", "back", "search", "extract", "done"]);
-const FIELDS = new Set(["kind", "snapshot_id", "target_id", "url", "text", "key", "reason", "query"]);
+const KINDS = new Set(["navigate", "click", "type", "press", "back", "search", "extract", "done", "open_tab", "switch_tab"]);
+const FIELDS = new Set(["kind", "snapshot_id", "target_id", "url", "text", "key", "reason", "query", "tab_ref"]);
 
 export class BrowserDriverError extends Error {
   constructor(code, message) { super(message); this.name = "BrowserDriverError"; this.code = code; }
@@ -40,8 +40,8 @@ export function validateSnapshotAction(action, observation, startUrl, history = 
       (action.reason != null && (typeof action.reason !== "string" || action.reason.length > MAX_ACTION_REASON))) {
     throw new BrowserDriverError("stale_action", "The proposed action does not match this observation.");
   }
-  const needed = { navigate: "url", type: "text", press: "key", search: "query" }[action.kind];
-  for (const field of ["url", "text", "key", "query"]) {
+  const needed = { navigate: "url", type: "text", press: "key", search: "query", switch_tab: "tab_ref" }[action.kind];
+  for (const field of ["url", "text", "key", "query", "tab_ref"]) {
     if (field === needed) {
       if (typeof action[field] !== "string" || (field !== "text" && !action[field])) {
         throw new BrowserDriverError("invalid_action", "The proposed action has invalid arguments.");
@@ -50,7 +50,7 @@ export function validateSnapshotAction(action, observation, startUrl, history = 
       throw new BrowserDriverError("invalid_action", "The proposed action contains unused arguments.");
     }
   }
-  const targeted = ["click", "type", "press"].includes(action.kind);
+  const targeted = ["click", "type", "press", "open_tab"].includes(action.kind);
   const target = targeted ? observation.elements.find((element) => element.id === action.target_id) : null;
   if (targeted && !target || !targeted && action.target_id != null) {
     throw new BrowserDriverError("unknown_target", "The proposed control was not observed on this page.");
@@ -69,6 +69,16 @@ export function validateSnapshotAction(action, observation, startUrl, history = 
         observation.elements.some((element) => element.href === destination && (element.sensitive || SENSITIVE.test(element.label)))) {
       throw new BrowserDriverError("unobserved_url", "Navigate only to an observed public reading destination.");
     }
+  }
+  if (action.kind === "open_tab") {
+    if (target.tag !== "a" || typeof target.href !== "string" ||
+        SENSITIVE.test(new URL(safePublicUrl(target.href)).pathname)) {
+      throw new BrowserDriverError("manual_review", "Open only an observed public reading link in a task tab.");
+    }
+  }
+  if (action.kind === "switch_tab" && (!Array.isArray(observation.tabs) ||
+      !observation.tabs.some((tab) => tab.ref === action.tab_ref && tab.active === false))) {
+    throw new BrowserDriverError("unknown_tab", "Switch only to another tab observed in this task.");
   }
   if (action.kind === "back" && history.length < 2) {
     throw new BrowserDriverError("no_history", "There is no previous page observed during this task.");

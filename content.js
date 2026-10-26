@@ -163,12 +163,12 @@
   }
   function validateShape(action) {
     const fields = new Set(["kind", "snapshot_id", "target_id", "url", "text", "key", "reason", "query"]);
-    const kinds = new Set(["navigate", "click", "type", "press", "back", "search", "extract", "done"]);
+    const kinds = new Set(["navigate", "click", "type", "press", "back", "search", "extract", "done", "open_tab"]);
     if (!action || typeof action !== "object" || Array.isArray(action) || !kinds.has(action.kind) ||
         Object.keys(action).some((field) => !fields.has(field)) || typeof action.snapshot_id !== "string") {
       fail("invalid_action", "The proposed browser action is invalid.");
     }
-    const targeted = ["click", "type", "press"].includes(action.kind);
+    const targeted = ["click", "type", "press", "open_tab"].includes(action.kind);
     if (targeted ? typeof action.target_id !== "string" : action.target_id != null) fail("invalid_action", "Invalid browser target.");
     const required = { navigate: "url", type: "text", press: "key", search: "query" }[action.kind];
     for (const field of ["url", "text", "key", "query"]) {
@@ -200,6 +200,14 @@
       if (["navigate", "back", "search"].includes(action.kind)) {
         navigation = destination(state, action, message);
         if (SENSITIVE.test(new URL(navigation).pathname)) fail("manual_review", "This destination requires manual navigation.");
+      } else if (action.kind === "open_tab") {
+        const element = currentTarget(state, action), info = metadata(element);
+        if (info.tag !== "a" || element.hasAttribute("download")) fail("manual_review", "Open only an observed public reading link.");
+        const resolved = publicUrl(info.href);
+        if (SENSITIVE.test(new URL(resolved).pathname)) fail("manual_review", "This link requires manual handling.");
+        check(state);
+        state.snapshot = null;
+        return { status: "executed", url: location.href, title: document.title.slice(0, MAX_LABEL), destination: resolved };
       } else if (action.kind === "click") {
         const element = currentTarget(state, action), info = metadata(element);
         if (info.tag === "a") {

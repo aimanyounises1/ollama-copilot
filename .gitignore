@@ -9,3 +9,4 @@ profiles/
 coverage/
 .venv/
 .test-venv/
+dist/

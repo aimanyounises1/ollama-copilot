@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS } from "../config.mjs";
+import { createBrowserActionTool } from "../agent-tools.mjs";
 import { AgentRun, CAPTURE_LIMITS, createReport, restoreCheckpoint, sourceUrl } from "../controller.mjs";
 
 const URL = "https://careers.fixture.example/roles/123";
@@ -225,4 +226,163 @@ test("long browser tab titles are bounded without blocking a readable task", asy
   const state = await f.run.start("Read this page");
   assert.equal(state.status, "completed");
   assert.ok(state.tab.title.length < 300);
+});
+
+
+function tabFixture() {
+  const f = fixture();
+  const home = "https://careers.fixture.example/search";
+  const detail = URL;
+  let current = "task-search";
+  let detailOpened = false;
+  let sequence = 0;
+  const metadata = () => ({
+    tab_ref: current,
+    tabs: [
+      { ref: "task-search", url: home, title: "Job search", active: current === "task-search", tabId: 7 },
+      ...(detailOpened ? [{ ref: "task-detail", url: detail, title: "Senior AI Engineer", active: current === "task-detail", tabId: 9 }] : []),
+    ],
+  });
+  const page = () => ({ url: current === "task-search" ? home : detail, title: current === "task-search" ? "Job search" : "Senior AI Engineer", ...metadata() });
+  f.driver.bindCurrentTab = async () => { f.calls.push("bind"); return { tabId: 7, ...page() }; };
+  f.driver.observe = async () => { f.calls.push("observe"); return { snapshot_id: `tabs-${sequence++}`, ...page(), text: current === "task-search" ? "Visible search result" : "Exact job detail evidence", elements: [{ id: "role-link", tag: "a", label: "Read role", href: detail }] }; };
+  f.driver.execute = async action => {
+    f.calls.push(`execute:${action.kind}`);
+    if (action.kind === "open_tab") { detailOpened = true; current = "task-detail"; }
+    if (action.kind === "switch_tab") current = action.tab_ref;
+    return { status: "executed", ...page() };
+  };
+  const actions = [
+    { kind: "open_tab", target_id: "role-link" },
+    { kind: "extract" },
+    { kind: "switch_tab", tab_ref: "task-search" },
+    { kind: "done" },
+  ];
+  let proposed = 0;
+  f.client.propose = async (goal, observation) => { f.calls.push("propose"); return { ...actions[proposed++], snapshot_id: observation.snapshot_id, reason: "Continue the observed job research" }; };
+  return f;
+}
+
+test("task tabs update current UI metadata and keep captured evidence at its actual source", async () => {
+  const f = tabFixture();
+  const state = await f.run.start("Open a job detail tab, capture it and return to search");
+  assert.equal(state.status, "completed");
+  assert.deepEqual(state.actions.map(action => action.kind), ["open_tab", "extract", "switch_tab", "done"]);
+  assert.equal(state.actions[2].tab_ref, "task-search");
+  assert.equal(state.tab.tab_ref, "task-search");
+  assert.equal(state.tab.title, "Job search");
+  assert.equal(state.tabs.length, 2);
+  assert.deepEqual(Object.keys(state.tabs[0]), ["ref", "title", "url", "active"]);
+  assert.equal(state.sources[0].url, URL);
+  assert.equal(state.sources[0].text, "Exact job detail evidence");
+  assert.equal(state.sources[1].url, "https://careers.fixture.example/search");
+  assert.ok(f.updates.some(update => update.tab?.tab_ref === "task-detail" && update.tab.url === URL));
+  const restored = restoreCheckpoint(state);
+  assert.equal(restored.status, "completed");
+  assert.equal(restored.tab.tab_ref, "task-search");
+  assert.equal(restored.actions[2].tab_ref, "task-search");
+  assert.deepEqual(restored.tabs, state.tabs);
+});
+
+test("unknown task tab proposals fail before judgment or dispatch even with an injected planner", async () => {
+  const f = tabFixture();
+  f.client.propose = async (goal, observation) => ({ kind: "switch_tab", snapshot_id: observation.snapshot_id, tab_ref: "user-private-tab", reason: "Switch" });
+  const state = await f.run.start("Read jobs");
+  assert.equal(state.status, "failed");
+  assert.ok(!f.calls.includes("judge"));
+  assert.ok(!f.calls.some(call => call.startsWith("execute:")));
+  assert.equal(state.sources.length, 0);
+});
+
+test("malformed saved tab catalogs are inert and legacy checkpoints still restore", async () => {
+  const f = tabFixture();
+  const saved = await f.run.start("Read a role");
+  saved.tabs[1].ref = saved.tabs[0].ref;
+  assert.equal(restoreCheckpoint(saved), null);
+  const legacy = await fixture().run.start("Read one page");
+  delete legacy.tabs;
+  assert.equal(restoreCheckpoint(legacy).status, "completed");
+});
+
+
+test("the compiled graph has distinct review, saved-checkpoint and execution branches", async () => {
+  const f = fixture();
+  await f.run.start("Read a role through the graph");
+  const topology = await f.run.graph.getGraphAsync({});
+  for (const name of ["bind", "observe", "route", "propose", "judge", "prepare_action", "execute", "capture", "finalize"]) {
+    assert.ok(topology.nodes[name], `Missing graph node: ${name}`);
+  }
+  const edges = topology.edges.map(edge => `${edge.source}->${edge.target}`);
+  assert.ok(edges.includes("judge->prepare_action"));
+  assert.ok(edges.includes("judge->finalize"));
+  assert.ok(edges.includes("prepare_action->execute"));
+  assert.ok(edges.includes("capture->observe"));
+  assert.ok(!edges.includes("judge->execute"));
+});
+
+test("the graph awaits the saved pending-action checkpoint before invoking its browser tool", { timeout: TEST_TIMEOUT_MS }, async () => {
+  const f = fixture(); const pendingSaved = deferred(); const permitSave = deferred();
+  f.run.onUpdate = async state => {
+    f.updates.push(state);
+    if (state.actions[0]?.status === "pending") { pendingSaved.resolve(); await permitSave.promise; }
+  };
+  const pending = f.run.start("Read the requested role");
+  await pendingSaved.promise;
+  assert.ok(f.calls.includes("judge"));
+  assert.ok(!f.calls.some(call => call.startsWith("execute:")));
+  permitSave.resolve();
+  assert.equal((await pending).status, "completed");
+  assert.equal(f.calls.filter(call => call === "execute:done").length, 1);
+});
+
+test("a failed browser dispatch is unconfirmed and never retried by the graph or tool", async () => {
+  const f = fixture();
+  f.driver.execute = async action => {
+    f.calls.push(`execute:${action.kind}`);
+    throw new Error("private command transport diagnostics");
+  };
+  const state = await f.run.start("Read the role once");
+  assert.equal(state.status, "failed");
+  assert.equal(state.actions[0].status, "unconfirmed");
+  assert.equal(f.calls.filter(call => call === "execute:done").length, 1);
+  assert.equal(f.calls.filter(call => call === "observe").length, 1);
+  assert.ok(!state.error.includes("private"));
+  assert.ok(f.calls.includes("cancel"));
+});
+
+test("an abandoned graph observation cannot change a later mission on the same controller", { timeout: TEST_TIMEOUT_MS }, async () => {
+  const f = fixture(); const entered = deferred(); const abandoned = deferred();
+  const ordinaryObserve = f.driver.observe;
+  let first = true;
+  f.driver.observe = () => {
+    if (first) { first = false; entered.resolve(); return abandoned.promise; }
+    return ordinaryObserve();
+  };
+  const initial = f.run.start("First task");
+  await entered.promise;
+  await f.run.stop();
+  assert.equal((await initial).status, "stopped");
+  const finished = await f.run.start("New task");
+  assert.equal(finished.status, "completed");
+  abandoned.resolve({ snapshot_id: "abandoned", url: URL, title: "Abandoned page", text: "Old evidence", elements: [] });
+  await abandoned.promise;
+  assert.equal(f.run.state.tab.title, "Senior AI Engineer");
+  assert.equal(f.run.state.goal, "New task");
+  assert.equal(f.run.state.sources[0].text, "Captured evidence");
+  assert.ok(!f.updates.some(state => state.tab?.title === "Abandoned page"));
+});
+
+test("the LangChain browser tool validates its own input before dispatch", async () => {
+  const calls = [];
+  const browserTool = createBrowserActionTool({
+    driver: { async execute(action) { calls.push(`execute:${action.kind}`); return { status: "executed", url: URL }; } },
+    guard() {}, onDispatch() { calls.push("dispatch"); },
+  });
+  const valid = { kind: "done", snapshot_id: "observed", reason: "Read evidence" };
+  await assert.rejects(browserTool.invoke({ action: { ...valid, javascript: "forged()" } }, { callbacks: [] }));
+  await assert.rejects(browserTool.invoke({ action: { kind: "switch_tab", snapshot_id: "observed", reason: "Switch without a ref" } }, { callbacks: [] }));
+  assert.deepEqual(calls, []);
+  const result = await browserTool.invoke({ action: valid }, { callbacks: [] });
+  assert.equal(result.status, "executed");
+  assert.deepEqual(calls, ["dispatch", "execute:done"]);
 });

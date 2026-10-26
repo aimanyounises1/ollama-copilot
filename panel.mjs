@@ -44,7 +44,7 @@ function render(state) {
   notice(state.error || STATUS_TEXT[state.status] || "Task state is unavailable.");
   byId("run-progress").max = state.maxSteps;
   byId("run-progress").value = state.step;
-  if (state.tab) byId("tab-status").textContent = `${state.tab.title || "Selected website"}\n${state.tab.url}`;
+  if (state.tab) byId("tab-status").textContent = `${state.tab.title || "Selected website"}\n${state.tab.url}${state.tabs?.length ? `\n${state.tabs.length} task-owned tab${state.tabs.length === 1 ? "" : "s"}` : ""}`;
   byId("route-status").textContent = state.route ? `Using ${state.route.model} for ${state.route.tool}. Decision model: ${state.decisionModel || "not recorded"}.${state.route.fallbackReason ? ` ${state.route.fallbackReason}` : ""}` : "The decision model chooses a configured LLM.";
   if (state.route) connection("Models ready", "connected");
   const sources = byId("sources-list"); sources.replaceChildren();

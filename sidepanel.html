@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Ollama Copilot</title>
   <link rel="stylesheet" href="sidepanel.css">
-  <script type="module" src="panel.mjs"></script>
+  <script type="module" src="dist/panel.js"></script>
 </head>
 <body>
   <header class="app-header">
@@ -35,7 +35,7 @@
       <form id="task-form">
         <label class="visually-hidden" for="goal">Task for Ollama Copilot</label>
         <textarea id="goal" name="goal" rows="4" maxlength="800" required placeholder="Find public AI engineering jobs and compare the employer career pages."></textarea>
-        <p class="scope-note">Ollama Copilot uses the tab you select. Review account changes yourself.</p>
+        <p class="scope-note">Ollama Copilot starts on your selected tab and can open observed reading links in task tabs.</p>
         <div class="task-actions">
           <button id="start-button" class="primary-button" type="submit">Start on this tab</button>
           <button id="stop-button" class="secondary-button" type="button" disabled>Stop</button>

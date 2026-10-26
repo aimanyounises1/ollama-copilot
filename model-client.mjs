@@ -10,8 +10,8 @@ export class ModelClientError extends Error {
   }
 }
 
-const ACTION_KINDS = Object.freeze(["navigate", "click", "type", "press", "back", "search", "extract", "done"]);
-const ACTION_FIELDS = Object.freeze(["kind", "snapshot_id", "target_id", "url", "text", "key", "reason", "query"]);
+const ACTION_KINDS = Object.freeze(["navigate", "click", "type", "press", "back", "search", "open_tab", "switch_tab", "extract", "done"]);
+const ACTION_FIELDS = Object.freeze(["kind", "snapshot_id", "target_id", "tab_ref", "url", "text", "key", "reason", "query"]);
 const SUPPORTED_KEYS = Object.freeze(["Enter", "Tab", "Escape"]);
 const ACTION_SCHEMA = Object.freeze({
   type: "object", additionalProperties: false,
@@ -19,6 +19,7 @@ const ACTION_SCHEMA = Object.freeze({
     kind: { type: "string", enum: ACTION_KINDS },
     snapshot_id: { type: "string", minLength: 1, maxLength: LIMITS.maxSnapshotChars },
     target_id: { type: ["string", "null"], minLength: 1, maxLength: LIMITS.maxTargetChars },
+    tab_ref: { type: ["string", "null"], minLength: 1, maxLength: LIMITS.maxTargetChars },
     url: { type: ["string", "null"], maxLength: LIMITS.maxUrlChars },
     text: { type: ["string", "null"], maxLength: LIMITS.maxActionText },
     query: { type: ["string", "null"], minLength: 1, maxLength: LIMITS.maxSearchQuery },
@@ -60,14 +61,15 @@ export function validateAction(value) {
     snapshot_id: boundedString(value.snapshot_id, LIMITS.maxSnapshotChars, "Snapshot identity"),
     reason: boundedString(value.reason, LIMITS.maxReasonChars, "Action reason", { empty: true }),
   };
-  const requirements = { navigate: ["url"], click: ["target_id"], type: ["target_id", "text"], press: ["target_id", "key"], search: ["query"], back: [], extract: [], done: [] };
+  const requirements = { navigate: ["url"], click: ["target_id"], type: ["target_id", "text"], press: ["target_id", "key"], search: ["query"], open_tab: ["target_id"], switch_tab: ["tab_ref"], back: [], extract: [], done: [] };
   const required = requirements[value.kind];
-  for (const key of ["target_id", "url", "text", "key", "query"]) {
+  for (const key of ["target_id", "tab_ref", "url", "text", "key", "query"]) {
     if (!required.includes(key) && value[key] !== undefined && value[key] !== null) {
       failure("invalid_action", "The browser action contains an unused argument.");
     }
   }
   if (required.includes("target_id")) result.target_id = boundedString(value.target_id, LIMITS.maxTargetChars, "Observed target");
+  if (required.includes("tab_ref")) result.tab_ref = boundedString(value.tab_ref, LIMITS.maxTargetChars, "Observed task tab");
   if (required.includes("url")) result.url = publicUrl(value.url);
   if (required.includes("text")) result.text = boundedString(value.text, LIMITS.maxActionText, "Typed text", { empty: true });
   if (required.includes("query")) result.query = boundedString(value.query, LIMITS.maxSearchQuery, "Search query").trim();
@@ -78,7 +80,40 @@ export function validateAction(value) {
   return result;
 }
 
-function observationState(value, decision = false) {
+/** Only the driver's explicitly task-owned tab catalog is exposed to models or checkpoints. */
+export function validateTaskTabs(value, maximum = LIMITS.maxSteps + 1) {
+  if (value.tabs === undefined && value.tab_ref === undefined) return null;
+  if (!Array.isArray(value.tabs) || !value.tabs.length || value.tabs.length > maximum) {
+    failure("invalid_input", "The task tab catalog is invalid or oversized.");
+  }
+  const currentRef = boundedString(value.tab_ref, LIMITS.maxTargetChars, "Current task tab");
+  const refs = new Set();
+  const tabs = value.tabs.map(tab => {
+    if (!object(tab) || typeof tab.active !== "boolean") failure("invalid_input", "A task tab is invalid.");
+    const ref = boundedString(tab.ref, LIMITS.maxTargetChars, "Task tab reference");
+    if (!/^[A-Za-z0-9_-]+$/.test(ref) || refs.has(ref)) failure("invalid_input", "Task tab references must be unique opaque labels.");
+    refs.add(ref);
+    return { ref, title: boundedString(tab.title, LIMITS.maxSourceChars, "Task tab title", { empty: true }).slice(0, LIMITS.maxTitleChars), url: publicUrl(tab.url), active: tab.active };
+  });
+  const active = tabs.filter(tab => tab.active);
+  if (active.length !== 1 || active[0].ref !== currentRef || active[0].url !== publicUrl(value.url)) {
+    failure("invalid_input", "The active task tab does not match the current page.");
+  }
+  return { tab_ref: currentRef, tabs };
+}
+
+export function validateObservedAction(action, current) {
+  if (action.snapshot_id !== current.snapshot_id) failure("stale_action", "The action belongs to a different browser observation.");
+  const target = action.target_id ? current.elements.find(item => item.id === action.target_id) : null;
+  if (action.target_id && !target) failure("unobserved_target", "The action target was not observed.");
+  if (action.kind === "open_tab" && (target?.tag !== "a" || !target.href)) failure("unobserved_target", "Open only an observed public reading link in a new tab.");
+  if (action.kind === "open_tab") publicUrl(target.href);
+  const tabTarget = action.tab_ref ? current.tabs?.find(tab => tab.ref === action.tab_ref) : null;
+  if (action.kind === "switch_tab" && (!tabTarget || tabTarget.active)) failure("unobserved_tab", "Switch only to another observed task-owned tab.");
+  return { target, tabTarget };
+}
+
+function observationState(value, decision = false, maximumTabs = LIMITS.maxSteps + 1) {
   if (!object(value) || !Array.isArray(value.elements) || value.elements.length > LIMITS.maxControls) {
     failure("invalid_input", "The browser observation is invalid.");
   }
@@ -100,6 +135,7 @@ function observationState(value, decision = false) {
     title: boundedString(value.title, LIMITS.maxSourceChars, "Page title", { empty: true }).slice(0, LIMITS.maxTitleChars),
     text: boundedString(value.text, LIMITS.maxSourceChars, "Page text", { empty: true }).slice(0, decision ? LIMITS.decisionObservationChars : LIMITS.maxObservationChars),
     elements: decision ? [] : elements,
+    ...validateTaskTabs(value, maximumTabs),
   };
 }
 
@@ -235,7 +271,7 @@ export class ModelClient {
 
   async route(goal, observation, signal) {
     await this.prepareModels(signal);
-    const state = { goal: goalText(goal, true), page: observationState(observation, true), prompt_version: PROMPT_VERSIONS.route };
+    const state = { goal: goalText(goal, true), page: observationState(observation, true, this.settings.maxSteps + 1), prompt_version: PROMPT_VERSIONS.route };
     const started = performance.now();
     const result = await this.request(ENDPOINTS.decisions, {
       model: this.settings.decisionModel, state,
@@ -263,8 +299,13 @@ export class ModelClient {
         || !Object.hasOwn(TOOL_CRITERIA, route.tool)) failure("invalid_route", "Only a configured model and registered tool may plan an action.");
     if (!Array.isArray(history)) failure("invalid_input", "The browser action history is invalid.");
     await this.prepareModels(signal);
-    const current = observationState(observation);
-    const schema = { ...ACTION_SCHEMA, properties: { ...ACTION_SCHEMA.properties, kind: { type: "string", enum: TOOL_ACTIONS[route.tool] } } };
+    const current = observationState(observation, false, this.settings.maxSteps + 1);
+    const schema = { ...ACTION_SCHEMA, properties: {
+      ...ACTION_SCHEMA.properties,
+      kind: { type: "string", enum: TOOL_ACTIONS[route.tool] },
+      target_id: { ...ACTION_SCHEMA.properties.target_id, enum: [...current.elements.map(element => element.id), null] },
+      tab_ref: { ...ACTION_SCHEMA.properties.tab_ref, enum: [...(current.tabs || []).filter(tab => !tab.active).map(tab => tab.ref), null] },
+    } };
     const past = history.slice(-LIMITS.maxHistory).map(item => {
       if (!object(item)) failure("invalid_input", "A browser history item is invalid.");
       const historical = item.action || item;
@@ -290,23 +331,20 @@ export class ModelClient {
     try { candidate = JSON.parse(result.message.content); } catch { failure("invalid_action", "The planner returned invalid action JSON."); }
     const action = validateAction(candidate);
     if (!TOOL_ACTIONS[route.tool].includes(action.kind)) failure("invalid_action", "The planner action does not match the routed tool.");
-    if (action.snapshot_id !== current.snapshot_id) failure("stale_action", "The planner action belongs to a different browser observation.");
-    if (action.target_id && !current.elements.some(item => item.id === action.target_id)) failure("unobserved_target", "The planner selected a control that was not observed.");
+    validateObservedAction(action, current);
     return action;
   }
 
   async judge(goal, observation, action, signal) {
-    const observed = observationState(observation);
-    const current = observationState(observation, true);
+    const observed = observationState(observation, false, this.settings.maxSteps + 1);
+    const current = observationState(observation, true, this.settings.maxSteps + 1);
     const proposed = validateAction(action);
-    const target = proposed.target_id ? observed.elements.find(item => item.id === proposed.target_id) : null;
-    if (proposed.target_id && !target) failure("unobserved_target", "The action target was not observed.");
-    if (proposed.snapshot_id !== current.snapshot_id) failure("stale_action", "The action no longer belongs to the current observation.");
+    const { target, tabTarget } = validateObservedAction(proposed, observed);
     await this.prepareModels(signal);
     const started = performance.now();
     const result = await this.request(ENDPOINTS.decisions, {
       model: this.settings.decisionModel,
-      state: { goal: goalText(goal, true), page: current, target, action: proposed, prompt_version: PROMPT_VERSIONS.judge },
+      state: { goal: goalText(goal, true), page: current, target, tab_target: tabTarget, action: proposed, prompt_version: PROMPT_VERSIONS.judge },
       questions: { useful: { type: "noul", instructions: JUDGE_INSTRUCTIONS } },
     }, signal);
     modelResult(result, this.settings.decisionModel);
