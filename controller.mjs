@@ -1,12 +1,13 @@
 /** A bounded, checkpointed browser task. Models advise; the driver owns execution policy. */
 import { LIMITS, validateSettings } from "./config.mjs";
 import { validateAction, validateObservedAction, validateTaskTabs } from "./model-client.mjs";
-import { safePublicUrl } from "./policy.mjs";
+import { BrowserDriverError, safePublicUrl } from "./policy.mjs";
+import { INTERRUPT, isInterrupted } from "@langchain/langgraph/web";
 import { createBrowserTaskGraph, browserGraphRecursionLimit } from "./agent-graph.mjs";
 import { createBrowserActionTool, createModelRunnables } from "./agent-tools.mjs";
 
-export const CAPTURE_LIMITS = Object.freeze({ maxChars: 8000, maxSources: 20, quoteChars: 1600, maxActivity: 80, activityChars: 400 });
-export const RUN_STATUSES = Object.freeze(["idle", "running", "stopping", "stopped", "completed", "paused", "failed", "limit_reached", "interrupted"]);
+export const CAPTURE_LIMITS = Object.freeze({ maxChars: 8000, maxSources: 20, maxActivity: 80, activityChars: 400 });
+export const RUN_STATUSES = Object.freeze(["idle", "running", "stopping", "stopped", "completed", "paused", "awaiting_permission", "failed", "limit_reached", "interrupted"]);
 const ACTIVE = new Set(["running", "stopping"]);
 const ACTION_FIELDS = Object.freeze(["kind", "snapshot_id", "target_id", "tab_ref", "url", "text", "key", "query", "reason"]);
 const ACTION_STATUSES = new Set(["pending", "executed", "unconfirmed", "cancelled", "paused"]);
@@ -44,7 +45,7 @@ export function createReport(state) {
   if (!state.sources.length) return [...lines, "No source evidence has been captured."].join("\n");
   lines.push("## Captured excerpts", "");
   for (const source of state.sources) {
-    const excerpt = source.text.slice(0, CAPTURE_LIMITS.quoteChars);
+    const excerpt = source.text.slice(0, CAPTURE_LIMITS.maxChars);
     lines.push(`### Source ${source.number}: ${escapeMarkdown(source.title || source.url)}`, "");
     lines.push(...excerpt.split("\n").map(line => `> ${escapeMarkdown(line)}`));
     lines.push("", `[${source.number}] [${escapeMarkdown(source.title || "Captured page")}](${`<${sourceUrl(source.url)}>`})`, "");
@@ -69,6 +70,15 @@ function safeObservation(value, maximumTabs) {
 function publicError(error) {
   return SAFE_ERROR_NAMES.has(error?.name) && typeof error?.code === "string" && typeof error?.message === "string" && error.message.length <= CAPTURE_LIMITS.activityChars ? error.message : "Ollama Copilot could not confirm a browser or model operation. Check the model connection and website access, then start again.";
 }
+/** Abort a wait without allowing a late permission result to resume the task. */
+function permissionWait(promise, signal) {
+  return new Promise((resolve, reject) => {
+    const aborted = () => { signal.removeEventListener("abort", aborted); reject(new DOMException("The browser task was stopped.", "AbortError")); };
+    signal.addEventListener("abort", aborted, { once: true });
+    Promise.resolve(promise).then(value => { signal.removeEventListener("abort", aborted); resolve(value); }, error => { signal.removeEventListener("abort", aborted); reject(error); });
+    if (signal.aborted) aborted();
+  });
+}
 function initialState(id, goal, maximum, now) {
   return { id, goal, status: "idle", step: 0, maxSteps: maximum, tab: null, tabs: [], sources: [], actions: [], activity: [], route: null, report: "", error: null, startedAt: now, updatedAt: now };
 }
@@ -82,7 +92,7 @@ export function restoreCheckpoint(value) {
     const state = initialState(id, text(value.goal, LIMITS.maxGoalChars, true), value.maxSteps, text(value.startedAt, LIMITS.maxTargetChars));
     state.updatedAt = text(value.updatedAt, LIMITS.maxTargetChars);
     state.decisionModel = value.decisionModel == null ? null : text(value.decisionModel, LIMITS.maxModelNameChars);
-    state.status = ACTIVE.has(value.status) ? "interrupted" : value.status;
+    state.status = ACTIVE.has(value.status) || value.status === "awaiting_permission" ? "interrupted" : value.status;
     state.step = value.step;
     state.error = state.status === "interrupted" ? "The previous panel session ended. Its evidence is retained; start a new task to continue." : value.error == null ? null : text(value.error, CAPTURE_LIMITS.activityChars);
     if (value.tab !== null) {
@@ -122,9 +132,54 @@ export class AgentRun {
     this._state = initialState(this.idFactory(), "", this.settings.maxSteps, this.now());
     this._state.decisionModel = this.settings.decisionModel;
     this._abort = null; this._running = false; this._updates = Promise.resolve(); this._pending = null; this._dispatched = false; this.graph = null;
+    this._permissionWait = false; this._permissionApproved = false;
+    this._permissionReviewRequired = false; this._permissionTarget = null; this._reviewing = null;
   }
   get state() { return clone(this._state); }
   get isRunning() { return this._running; }
+  get canContinue() {
+    return this._permissionWait && !this._running && this._state.status === "awaiting_permission" &&
+      !this._abort?.signal.aborted && this._safePermissionBoundary();
+  }
+  get permissionReviewRequired() { return this._permissionReviewRequired; }
+  get reviewedPermissionOrigin() { return this.canContinue ? this._permissionTarget?.origin || null : null; }
+  /** Review is a separate human gesture; it cannot grant access or invoke the graph. */
+  async reviewPermissionTarget() {
+    if (this._running || this._reviewing) throw new AgentRunError("already_running", "The task is already running or reviewing a website.");
+    if (!this.canContinue) throw new AgentRunError("not_resumable", "This task cannot review website access.");
+    const signal = this._abort.signal, id = this._state.id, review = Symbol();
+    this._reviewing = review; this._permissionTarget = null;
+    try {
+      const target = await permissionWait(this.driver.reviewPermissionTarget(signal), signal);
+      this._guard(signal);
+      if (this._state.id !== id || !this.canContinue) throw new DOMException("The browser task was stopped.", "AbortError");
+      if (!plain(target) || Object.keys(target).some(key => !["url", "origin"].includes(key)) ||
+          typeof target.origin !== "string" || new URL(safePublicUrl(target.url)).origin !== target.origin) {
+        throw new AgentRunError("invalid_tab", "Chrome did not confirm a public current website for review.");
+      }
+      this._permissionTarget = { url: safePublicUrl(target.url), origin: target.origin };
+      this._permissionReviewRequired = false;
+      return { ...this._permissionTarget };
+    } catch (error) {
+      if (signal.aborted || error?.name === "AbortError") throw error;
+      this._permissionTarget = null;
+      if (error instanceof BrowserDriverError && error.code === "permission_review_required") {
+        this._permissionReviewRequired = true;
+        throw error;
+      }
+      this._permissionWait = false; this._permissionReviewRequired = false;
+      this._state.status = "failed"; this._state.error = publicError(error); this._note(this._state.error);
+      try { await this.driver.cancel(); }
+      catch { this._state.error = "Browser control could not be released cleanly. Close this panel and review the tab."; }
+      await this._publish();
+      throw error;
+    } finally { if (this._reviewing === review) this._reviewing = null; }
+  }
+  _safePermissionBoundary() {
+    return this._state.tab !== null && this.driver.canContinuePermission === true &&
+      this._pending === null && !this._dispatched && this._state.step < this._state.maxSteps &&
+      this._state.actions.every(action => action.status === "executed");
+  }
   _guard(signal = this._abort.signal) { signal.throwIfAborted(); }
   _note(message) {
     this._state.activity.push({ message: message.slice(0, CAPTURE_LIMITS.activityChars), at: this.now() });
@@ -179,11 +234,29 @@ export class AgentRun {
       },
       observe: async state => {
         guard();
-        const observation = safeObservation(await this.driver.observe(), this.settings.maxSteps + 1); guard();
+        let raw;
+        try { raw = await this.driver.observe(); }
+        catch (error) {
+          guard();
+          if (!(error instanceof BrowserDriverError) || error.code !== "site_access_required" || !this._safePermissionBoundary()) throw error;
+          this._state.status = "awaiting_permission";
+          this._state.error = "This website needs access. Allow and continue to keep researching in this task.";
+          this._note("Waiting for explicit website access before a fresh observation. No browser action is pending.");
+          await this._publish(); guard();
+          return { needsPermission: true, observation: null, modelRoute: null, action: null, judgment: null, result: null, approved: false };
+        }
+        const observation = safeObservation(raw, this.settings.maxSteps + 1); guard();
         const step = state.step + 1;
         this._state.step = step; this._updateTab(observation);
         this._note(`Observed ${observation.title || observation.url}`);
-        return { step, observation, capturedAt: this.now(), action: null, judgment: null, result: null, approved: false };
+        return { step, observation, capturedAt: this.now(), action: null, judgment: null, result: null, approved: false, needsPermission: false };
+      },
+      permission_gate: () => {
+        // A native checkpoint breakpoint stops before this side-effect-free gate.
+        guard();
+        if (!this._permissionApproved) throw new AgentRunError("not_resumable", "Website access must be approved from this open panel.");
+        this._permissionApproved = false;
+        return { needsPermission: false, observation: null, modelRoute: null, action: null, judgment: null, result: null, approved: false };
       },
       route: async state => {
         guard();
@@ -227,7 +300,7 @@ export class AgentRun {
         const result = await browserTool.invoke({ action: state.action }, options); guard();
         if (!plain(result) || result.status !== "executed") throw new AgentRunError("unconfirmed_action", "The browser did not confirm the action outcome.");
         this._pending.status = "executed"; this._pending = null; this._dispatched = false;
-        if (["open_tab", "switch_tab"].includes(state.action.kind)) this._updateTab(result);
+        if (result.tabs !== undefined || ["open_tab", "switch_tab"].includes(state.action.kind)) this._updateTab(result);
         return { result };
       },
       capture: async state => {
@@ -253,34 +326,82 @@ export class AgentRun {
       finalize: () => { guard(); return { finished: true }; },
     });
   }
+  async _invoke(input, signal, continuation = false) {
+    let checkingPermission = false;
+    try {
+      this._guard(signal);
+      if (continuation) {
+        checkingPermission = true;
+        await permissionWait(this.driver.resumeAfterPermission(signal), signal); this._guard(signal);
+        checkingPermission = false;
+        this._permissionApproved = true;
+        this._note("Website access approved. Continuing the same task with a fresh observation and model review.");
+      }
+      await this._publish(); this._guard(signal);
+      if (!continuation) this.graph = this._workflow(signal);
+      const result = await this.graph.invoke(input, { signal, callbacks: [], configurable: { thread_id: this._state.id }, recursionLimit: browserGraphRecursionLimit(this.settings.maxSteps) });
+      this._guard(signal);
+      if (isInterrupted(result)) {
+        const pauses = result[INTERRUPT];
+        if (pauses.length !== 0 || result.needsPermission !== true || this._state.status !== "awaiting_permission" || !this._safePermissionBoundary()) {
+          throw new AgentRunError("not_resumable", "The task cannot safely continue from this interruption.");
+        }
+        this._permissionWait = true;
+      } else if (this._state.status === "awaiting_permission") {
+        throw new AgentRunError("not_resumable", "The permission checkpoint could not be confirmed.");
+      }
+    } catch (error) {
+      const needsReview = checkingPermission && !signal.aborted && error instanceof BrowserDriverError &&
+        error.code === "permission_review_required" && this._safePermissionBoundary();
+      this._permissionWait = needsReview;
+      this._permissionReviewRequired = needsReview;
+      if (this._pending) this._pending.status = this._dispatched ? "unconfirmed" : "cancelled";
+      if (needsReview) { this._state.status = "awaiting_permission"; this._state.error = publicError(error); this._note(this._state.error); }
+      else if (signal.aborted || error?.name === "AbortError") { this._state.status = "stopped"; this._state.error = null; this._note("Stopped. No further actions will run."); }
+      else { this._state.status = error?.code === "source_limit" ? "limit_reached" : "failed"; this._state.error = publicError(error); this._note(this._state.error); }
+    } finally {
+      this._permissionApproved = false; this._permissionTarget = null;
+      try { await this.driver.cancel(); }
+      catch { this._permissionWait = false; this._permissionReviewRequired = false; this._state.status = "failed"; this._state.error = "Browser control could not be released cleanly. Close this panel and review the tab."; this._note(this._state.error); }
+      this._running = false;
+    }
+    try { await this._publish(); }
+    catch (error) { this._permissionWait = false; this._permissionReviewRequired = false; this._state.status = "failed"; this._state.error = publicError(error); throw error; }
+    return this.state;
+  }
   async start(goal) {
-    if (this._running) throw new AgentRunError("already_running", "Stop the current task before starting another.");
+    if (this._running || this._permissionWait) throw new AgentRunError("already_running", "Stop the current task before starting another.");
     goal = text(goal, LIMITS.maxGoalChars).trim();
+    this._abort?.abort();
     this._abort = new AbortController(); this._running = true; this._pending = null; this._dispatched = false;
-    const signal = this._abort.signal;
+    this._permissionWait = false; this._permissionApproved = false;
+    this._permissionReviewRequired = false; this._permissionTarget = null; this._reviewing = null;
     this._state = initialState(this.idFactory(), goal, this.settings.maxSteps, this.now());
     this._state.decisionModel = this.settings.decisionModel;
     this._state.status = "running";
     this._note("Starting on the explicitly selected tab.");
-    try {
-      await this._publish(); this._guard(signal);
-      this.graph = this._workflow(signal);
-      await this.graph.invoke({ goal, step: 0, approved: false, finished: false }, { signal, callbacks: [], recursionLimit: browserGraphRecursionLimit(this.settings.maxSteps) });
-      this._guard(signal);
-    } catch (error) {
-      if (this._pending) this._pending.status = this._dispatched ? "unconfirmed" : "cancelled";
-      if (signal.aborted || error?.name === "AbortError") { this._state.status = "stopped"; this._state.error = null; this._note("Stopped. No further actions will run."); }
-      else { this._state.status = error?.code === "source_limit" ? "limit_reached" : "failed"; this._state.error = publicError(error); this._note(this._state.error); }
-    } finally {
-      try { await this.driver.cancel(); }
-      catch { this._state.status = "failed"; this._state.error = "Browser control could not be released cleanly. Close this panel and review the tab."; this._note(this._state.error); }
-      this._running = false;
-    }
-    await this._publish();
-    return this.state;
+    return this._invoke({ goal, step: 0, approved: false, finished: false, needsPermission: false }, this._abort.signal);
+  }
+  /** Only an explicit same-panel gesture can grant access and resume this graph. */
+  async continueAfterPermission() {
+    if (this._running || this._reviewing) throw new AgentRunError("already_running", "The task is already running or reviewing a website.");
+    if (!this.canContinue) throw new AgentRunError("not_resumable", "This task cannot continue. Start a new task after reviewing the page.");
+    if (this._permissionReviewRequired && !this._permissionTarget) throw new AgentRunError("permission_review_required", "Review the current website before continuing this task.");
+    this._permissionWait = false; this._running = true;
+    this._state.status = "running"; this._state.error = null;
+    return this._invoke(null, this._abort.signal, true);
   }
   async stop() {
+    this._permissionTarget = null; this._permissionReviewRequired = false;
+    if (this._permissionWait && !this._running) {
+      this._permissionWait = false; this._permissionApproved = false; this._abort?.abort();
+      this._state.status = "stopped"; this._state.error = null;
+      this._note("Stopped while waiting for website access. This continuation is no longer available.");
+      await Promise.all([this.driver.cancel(), this._publish()]);
+      return;
+    }
     if (!this._running || this._abort.signal.aborted) return;
+    this._permissionWait = false; this._permissionApproved = false;
     this._abort.abort(); this._state.status = "stopping";
     this._note("Stopping the task and disconnecting browser control.");
     await Promise.all([this.driver.cancel(), this._publish()]);

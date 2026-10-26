@@ -7,7 +7,7 @@ import { AgentRun, restoreCheckpoint, sourceUrl } from "./controller.mjs";
 const STORAGE_KEYS = Object.freeze({ settings: "jevSettings", checkpoint: "jevCheckpoint" });
 const ACTIVE = new Set(["running", "stopping"]);
 const FIELD_IDS = Object.freeze(["ollama-url", "decision-model", "fast-model", "strong-model", "max-steps", "typing-delay", "search-url"]);
-const STATUS_TEXT = Object.freeze({ idle: "Ready when you are.", running: "Ollama Copilot is working on the selected tab.", stopping: "Stopping browser control…", stopped: "Stopped. Captured evidence is retained.", completed: "Task complete. Captured evidence is ready.", paused: "Paused for review.", failed: "The task needs attention.", limit_reached: "Step limit reached. Captured evidence is retained.", interrupted: "Previous task interrupted. Start again to continue." });
+const STATUS_TEXT = Object.freeze({ idle: "Ready when you are.", running: "Ollama Copilot is working on the selected tab.", stopping: "Stopping browser control…", stopped: "Stopped. Captured evidence is retained.", completed: "Task complete. Captured evidence is ready.", paused: "Paused for review.", awaiting_permission: "Allow this website to continue the same task.", failed: "The task needs attention.", limit_reached: "Step limit reached. Captured evidence is retained.", interrupted: "Previous task interrupted. Start again to continue." });
 const byId = id => document.getElementById(id);
 let settings = validateSettings(DEFAULT_SETTINGS);
 let currentRun = null;
@@ -31,11 +31,20 @@ function readSettings() {
   return validateSettings({ ...settings, ollamaUrl: byId("ollama-url").value.trim(), decisionModel: byId("decision-model").value.trim(), fastModel: byId("fast-model").value.trim(), strongModel: byId("strong-model").value.trim(), maxSteps: Number(byId("max-steps").value), typingDelayMs: Number(byId("typing-delay").value), searchUrl: byId("search-url").value.trim() });
 }
 function controls() {
-  const busy = pendingUi || ACTIVE.has(currentState?.status);
+  const waiting = currentRun !== null && currentState?.status === "awaiting_permission";
+  const continuing = currentRun?.canContinue === true;
+  const busy = pendingUi || ACTIVE.has(currentState?.status) || waiting;
   byId("start-button").disabled = busy;
-  byId("stop-button").disabled = currentState?.status !== "running";
+  byId("start-button").hidden = waiting;
+  byId("continue-button").hidden = !continuing;
+  byId("continue-button").disabled = pendingUi || !continuing || currentRun?.permissionReviewRequired === true;
+  byId("continue-button").textContent = currentRun?.reviewedPermissionOrigin
+    ? `Allow ${currentRun.reviewedPermissionOrigin} and continue` : "Allow and continue";
+  byId("stop-button").disabled = !(currentRun?.isRunning || waiting);
   byId("goal").disabled = busy;
-  for (const id of [...FIELD_IDS, "save-settings", "check-models", "grant-site"]) byId(id).disabled = busy;
+  for (const id of [...FIELD_IDS, "save-settings", "check-models"]) byId(id).disabled = busy;
+  byId("grant-site").textContent = waiting ? "Review current website" : "Allow this website";
+  byId("grant-site").disabled = waiting ? pendingUi || !continuing : busy;
   byId("export-button").disabled = !currentState?.sources?.length;
 }
 function render(state) {
@@ -89,9 +98,16 @@ async function start(event) {
   finally { pendingUi = false; controls(); }
 }
 async function stop() {
-  if (!currentRun?.isRunning) return;
+  if (!currentRun?.isRunning && currentState?.status !== "awaiting_permission") return;
   try { await currentRun.stop(); }
   catch { notice("Browser control could not confirm a clean Stop. Close this panel and review the tab."); }
+}
+async function continueTask() {
+  if (pendingUi || !currentRun?.canContinue) return;
+  pendingUi = true; controls();
+  try { await currentRun.continueAfterPermission(); }
+  catch (error) { notice(safeMessage(error)); }
+  finally { pendingUi = false; controls(); }
 }
 async function save() {
   if (pendingUi || currentRun?.isRunning) return;
@@ -123,6 +139,11 @@ async function grantSite() {
   if (pendingUi || currentRun?.isRunning) return;
   pendingUi = true; controls();
   try {
+    if (currentRun?.canContinue) {
+      const target = await currentRun.reviewPermissionTarget();
+      notice(`Reviewed current website: ${target.origin}. Choose Allow and continue to approve this exact page.`);
+      return;
+    }
     // Keep the ended mission's pinned tab and pending origin. Chrome may hide
     // its URL after cross-origin navigation until the user grants that site.
     const driver = currentRun?.driver || new BrowserDriver(readSettings());
@@ -155,6 +176,7 @@ async function initialize() {
     else controls();
     byId("task-form").addEventListener("submit", start);
     byId("stop-button").addEventListener("click", stop);
+    byId("continue-button").addEventListener("click", continueTask);
     byId("save-settings").addEventListener("click", save);
     byId("check-models").addEventListener("click", checkModels);
     byId("grant-site").addEventListener("click", grantSite);
@@ -165,6 +187,6 @@ async function initialize() {
 }
 window.addEventListener("pagehide", () => {
   healthAbort?.abort();
-  if (currentRun?.isRunning) currentRun.stop().catch(() => console.warn("Ollama Copilot could not persist the final Stop checkpoint after the panel closed."));
+  if (currentRun?.isRunning || currentState?.status === "awaiting_permission") currentRun?.stop().catch(() => console.warn("Ollama Copilot could not persist the final Stop checkpoint after the panel closed."));
 });
 initialize();

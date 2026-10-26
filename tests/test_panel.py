@@ -13,6 +13,7 @@ EXTENSION = Path(__file__).resolve().parents[1]
 PANEL_ORIGIN = "https://panel.fixture.example"
 START_URL = "https://careers.fixture.example/roles/123"
 TARGET_URL = "https://target.fixture.example/jobs"
+REVIEWED_URL = "https://reviewed.fixture.example/jobs/role"
 NOW = "2026-10-25T06:00:00.000Z"
 TIMEOUT_MS = 5000
 
@@ -22,7 +23,9 @@ ModelClient.prototype.route = async function() {
   return {model:this.settings.fastModel, modelRole:'fast', tool:'search', confidence:1, durationMs:1, fallbackReason:null};
 };
 ModelClient.prototype.propose = async function(goal, observation) {
-  return {kind:'search', snapshot_id:observation.snapshot_id, query:'public AI jobs', reason:'Search public roles'};
+  return window.__fixture.routeCalls > 1
+    ? {kind:'done', snapshot_id:observation.snapshot_id, reason:'Captured the employer role'}
+    : {kind:'search', snapshot_id:observation.snapshot_id, query:'public AI jobs', reason:'Search public roles'};
 };
 ModelClient.prototype.judge = async function() { return {score:1, durationMs:1}; };
 """
@@ -41,9 +44,13 @@ BrowserDriver.prototype.observe = async function() {
 BrowserDriver.prototype.execute = async function(action) {
   await this._activeTab();
   window.__fixture.executeCalls += 1;
-  this.pendingOrigin = new URL(window.__fixture.targetUrl).origin;
-  window.__fixture.activeUrl = null;
-  return {status:'executed',url:this.startUrl,title:'Role research'};
+  if (action.kind === 'search') {
+    this.pendingOrigin = new URL(window.__fixture.targetUrl).origin;
+    window.__fixture.activeUrl = null;
+    const tab=this.taskTabs.get(this.tabRef);tab.url=window.__fixture.targetUrl;
+    return {status:'executed',url:tab.url,title:'Role research',tab_ref:this.tabRef,tabs:this._tabMetadata()};
+  }
+  return {status:'executed',url:window.__fixture.activeUrl,title:'Role research'};
 };
 """
 
@@ -96,13 +103,13 @@ def panel(panel_bundle):
         browser = playwright.chromium.launch(headless=True)
         opened = []
 
-        def create(*, checkpoint=None, fail_checkpoints=False):
+        def create(*, checkpoint=None, fail_checkpoints=False, deny_permission=False, hide_after_grant=False):
             page = browser.new_page(viewport={"width": 360, "height": 900}, accept_downloads=True)
             page.set_default_timeout(TIMEOUT_MS)
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             data = {"checkpoint": checkpoint, "failCheckpoints": fail_checkpoints,
-                    "activeUrl": START_URL, "targetUrl": TARGET_URL}
+                    "activeUrl": START_URL, "targetUrl": TARGET_URL, "denyPermission": deny_permission, "hideAfterGrant": hide_after_grant}
             page.add_init_script("""
 const input = """ + json.dumps(data) + r""";
 window.__fixture = {...input, access:[], writes:[], routeCalls:0, bindCalls:0, executeCalls:0, grantRequests:[]};
@@ -121,13 +128,15 @@ window.chrome = {
   runtime:{id:'fixture-extension'},
   storage:{local:storageArea('local'),session:storageArea('session')},
   tabs:{async query() {
-    const tab = {id:7,windowId:1,title:'Role research',status:'complete'};
+    const tab = {id:window.__fixture.activeTabId || 7,windowId:window.__fixture.activeWindowId || 1,title:'Role research',status:'complete'};
     if (window.__fixture.activeUrl) tab.url = window.__fixture.activeUrl;
     return [tab];
   }},
   permissions:{async request(value) {
     window.__fixture.grantRequests.push(value);
-    window.__fixture.activeUrl = window.__fixture.targetUrl;
+    if (window.__fixture.denyPermission) return false;
+    if (window.__fixture.hideAfterGrant && !window.__fixture.activeUrl) return true;
+    window.__fixture.activeUrl ||= window.__fixture.targetUrl;
     return true;
   }}
 };
@@ -192,21 +201,143 @@ def test_source_render_and_export_use_capture_text_without_interpreting_markup(p
     assert download.value.path().read_text() == report
 
 
-def test_cross_origin_permission_recovery_uses_the_ended_missions_pinned_driver(panel):
-    page = panel()
+def begin_permission_wait(page):
     page.locator("#goal").fill("Find public AI roles")
     page.get_by_role("button", name="Start on this tab", exact=True).click()
-    page.wait_for_function("() => document.querySelector('#run-status').textContent.includes('Allow this website')")
+    page.wait_for_function("() => window.__fixture.checkpoint.status === 'awaiting_permission' && !document.querySelector('#continue-button').disabled")
+    return page.evaluate("window.__fixture.checkpoint")
+
+
+def test_cross_origin_permission_continue_keeps_the_same_mission_and_uses_browser_graph(panel):
+    page = panel()
+    paused = begin_permission_wait(page)
     assert page.evaluate("window.__fixture.activeUrl") is None
     assert page.evaluate("window.__fixture.bindCalls") == 1
     assert page.evaluate("window.__fixture.executeCalls") == 1
-    page.get_by_role("button", name="Allow this website", exact=True).click()
-    page.wait_for_function("() => document.querySelector('#run-status').textContent.includes('Website access granted')")
+    assert page.get_by_role("button", name="Review current website", exact=True).is_enabled()
+    assert page.get_by_role("button", name="Stop", exact=True).is_enabled()
+    assert page.get_by_role("button", name="Allow and continue", exact=True).is_visible()
+    page.get_by_role("button", name="Allow and continue", exact=True).click()
+    page.wait_for_function("() => window.__fixture.checkpoint.status === 'completed'")
+    completed = page.evaluate("window.__fixture.checkpoint")
+    assert completed["id"] == paused["id"]
+    assert completed["goal"] == paused["goal"]
+    assert completed["startedAt"] == paused["startedAt"]
+    assert completed["actions"][0] == paused["actions"][0]
+    assert [action["kind"] for action in completed["actions"]] == ["search", "done"]
+    assert completed["sources"][0]["url"] == TARGET_URL
     assert page.evaluate("window.__fixture.grantRequests") == [{"origins": ["https://target.fixture.example/*"]}]
     assert page.evaluate("window.__fixture.bindCalls") == 1
+    assert page.evaluate("window.__fixture.executeCalls") == 2
+    assert page.evaluate("window.__fixture.routeCalls") == 2
+    assert not page.get_by_role("button", name="Allow and continue", exact=True).is_visible()
+
+
+def test_redirect_review_keeps_same_browser_graph_and_shows_actual_origin_before_continue(panel):
+    page = panel(hide_after_grant=True)
+    paused = begin_permission_wait(page)
+    page.get_by_role('button', name='Allow and continue', exact=True).click()
+    page.wait_for_function("() => window.__fixture.checkpoint.status==='awaiting_permission' && document.querySelector('#continue-button').disabled")
+    assert page.evaluate('window.__fixture.checkpoint.id') == paused['id']
+    assert page.evaluate('window.__fixture.executeCalls') == 1
+    assert page.evaluate('window.__fixture.routeCalls') == 1
+    assert 'Chrome still hides' in page.locator('#run-status').text_content()
+    page.get_by_role('button', name='Review current website', exact=True).click()
+    page.wait_for_function("() => document.querySelector('#run-status').textContent.includes('toolbar icon')")
+    assert page.evaluate('window.__fixture.checkpoint.status') == 'awaiting_permission'
+    assert page.locator('#continue-button').is_disabled()
+    page.evaluate('url => { window.__fixture.activeUrl=url; }', REVIEWED_URL)
+    page.get_by_role('button', name='Review current website', exact=True).click()
+    reviewed = page.get_by_role('button', name='Allow https://reviewed.fixture.example and continue', exact=True)
+    reviewed.wait_for()
+    assert reviewed.is_enabled()
+    assert 'Reviewed current website: https://reviewed.fixture.example' in page.locator('#run-status').text_content()
+    assert page.evaluate('window.__fixture.grantRequests') == [{'origins': ['https://target.fixture.example/*']}]
+    assert page.evaluate('window.__fixture.routeCalls') == 1
+    reviewed.click()
+    page.wait_for_function("() => window.__fixture.checkpoint.status==='completed'")
+    complete = page.evaluate('window.__fixture.checkpoint')
+    assert complete['id'] == paused['id']
+    assert complete['goal'] == paused['goal']
+    assert complete['actions'][0] == paused['actions'][0]
+    assert [action['kind'] for action in complete['actions']] == ['search', 'done']
+    assert complete['sources'][0]['url'] == REVIEWED_URL
+    assert page.evaluate('window.__fixture.bindCalls') == 1
+    assert page.evaluate('window.__fixture.executeCalls') == 2
+    assert page.evaluate('window.__fixture.grantRequests') == [
+        {'origins': ['https://target.fixture.example/*']},
+        {'origins': ['https://reviewed.fixture.example/*']},
+    ]
+
+
+def test_reviewed_page_change_blocks_browser_continue_without_another_grant(panel):
+    page = panel()
+    begin_permission_wait(page)
+    page.evaluate('url => { window.__fixture.activeUrl=url; }', REVIEWED_URL)
+    page.get_by_role('button', name='Review current website', exact=True).click()
+    reviewed = page.get_by_role('button', name='Allow https://reviewed.fixture.example and continue', exact=True)
+    reviewed.wait_for()
+    page.evaluate("() => { window.__fixture.activeUrl += '/changed'; }")
+    reviewed.click()
+    page.wait_for_function("() => window.__fixture.checkpoint.status==='failed'")
+    assert page.evaluate('window.__fixture.grantRequests') == []
+    assert page.evaluate('window.__fixture.routeCalls') == 1
+    assert page.evaluate('window.__fixture.executeCalls') == 1
+
+
+def test_stop_during_pending_browser_review_cannot_stage_late_url(panel):
+    page = panel()
+    begin_permission_wait(page)
+    page.evaluate("""() => {
+      chrome.tabs.query = () => new Promise(resolve => { window.__fixture.finishReview=resolve; });
+    }""")
+    page.get_by_role('button', name='Review current website', exact=True).click()
+    page.wait_for_function("() => typeof window.__fixture.finishReview==='function'")
+    page.get_by_role('button', name='Stop', exact=True).click()
+    page.wait_for_function("() => window.__fixture.checkpoint.status==='stopped'")
+    page.evaluate('url => window.__fixture.finishReview([{id:7,windowId:1,url}])', REVIEWED_URL)
+    assert not page.locator('#continue-button').is_visible()
+    assert page.evaluate('window.__fixture.grantRequests') == []
+    assert page.evaluate('window.__fixture.executeCalls') == 1
+
+
+def test_stop_while_permission_waiting_hides_continuation_without_grant_or_replay(panel):
+    page = panel()
+    paused = begin_permission_wait(page)
+    page.get_by_role("button", name="Stop", exact=True).click()
+    page.wait_for_function("() => window.__fixture.checkpoint.status === 'stopped'")
+    assert not page.get_by_role("button", name="Allow and continue", exact=True).is_visible()
+    assert page.evaluate("window.__fixture.grantRequests") == []
+    assert page.evaluate("window.__fixture.checkpoint.actions") == paused["actions"]
+    assert page.evaluate("window.__fixture.executeCalls") == 1
+
+
+def test_permission_wait_restored_in_another_panel_is_inert(panel):
+    first = panel()
+    paused = begin_permission_wait(first)
+    restored = panel(checkpoint=paused)
+    restored.wait_for_function("() => window.__fixture.checkpoint.status === 'interrupted'")
+    assert not restored.get_by_role("button", name="Allow and continue", exact=True).is_visible()
+    assert restored.evaluate("window.__fixture.bindCalls") == 0
+    assert restored.evaluate("window.__fixture.executeCalls") == 0
+    assert restored.evaluate("window.__fixture.grantRequests") == []
+
+
+@pytest.mark.parametrize("boundary", ["denied", "changed-tab", "changed-window"])
+def test_permission_continuation_refusal_never_dispatches_again(panel, boundary):
+    page = panel(deny_permission=boundary == "denied")
+    paused = begin_permission_wait(page)
+    if boundary == "changed-tab":
+        page.evaluate("() => { window.__fixture.activeTabId=99; }")
+    if boundary == "changed-window":
+        page.evaluate("() => { window.__fixture.activeWindowId=2; }")
+    page.get_by_role("button", name="Allow and continue", exact=True).click()
+    page.wait_for_function("() => window.__fixture.checkpoint.status === 'failed'")
+    assert page.evaluate("window.__fixture.checkpoint.id") == paused["id"]
     assert page.evaluate("window.__fixture.executeCalls") == 1
     assert page.evaluate("window.__fixture.routeCalls") == 1
-    assert page.get_by_role("button", name="Start on this tab", exact=True).is_enabled()
+    assert not page.get_by_role("button", name="Allow and continue", exact=True).is_visible()
+    assert len(page.evaluate("window.__fixture.grantRequests")) == (1 if boundary == "denied" else 0)
 
 
 def test_persistent_checkpoint_failure_shows_terminal_state_and_reenables_start(panel):

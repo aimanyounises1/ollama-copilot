@@ -545,6 +545,189 @@ def test_delayed_owning_window_bind_cannot_replace_a_newer_binding(actor):
     assert actor.evaluate("() => fixture.bindQueries.every(query => query.options.currentWindow === true)") is True
 
 
+def waiting_permission_driver(page):
+    """Pause a confirmed task-owned tab using the real driver and actor."""
+    load_driver(page)
+    page.evaluate("""async () => {
+      fixture.resumeURL = location.href.replace('browser-fixture', 'employer-fixture') + 'jobs/role';
+      const link = document.createElement('a'); link.href = fixture.resumeURL;
+      link.textContent = 'Employer job'; document.querySelector('main').append(link);
+      const snapshot = await driver.observe();
+      const targetId = snapshot.elements.find(element => element.href === fixture.resumeURL).id;
+      await driver.execute({kind:'open_tab', target_id:targetId, snapshot_id:snapshot.snapshot_id});
+      const target = fixture.tabData.get(driver.tabId); target.url = undefined;
+      try { await driver.observe(); throw new Error('Expected site access to be withheld'); }
+      catch(error) { if(error.code !== 'site_access_required') throw error; }
+      await driver.cancel();
+      fixture.permissionSignal = new AbortController();
+      fixture.retained = {id:driver.tabId, windowId:driver.windowId, ref:driver.tabRef,
+        generation:driver.generation, history:[...driver.history], tabs:driver._tabMetadata()};
+      chrome.permissions.request = async options => {
+        fixture.permissionOrigins.push(options.origins);
+        target.url = fixture.resumeURL; return true;
+      };
+    }""")
+
+
+def test_permission_resume_grants_exact_retained_origin_and_preserves_task_tabs(actor):
+    waiting_permission_driver(actor)
+    assert actor.evaluate("() => driver.canContinuePermission") is True
+    assert actor.evaluate("() => driver.resumeAfterPermission(fixture.permissionSignal.signal)") is True
+    state = actor.evaluate("""() => ({id:driver.tabId,windowId:driver.windowId,ref:driver.tabRef,
+      history:driver.history,generation:driver.generation,cancelled:driver.cancelled,
+      fresh:driver.observation===null,allowNewDocument:driver.allowNewDocument,
+      tabs:driver._tabMetadata(),before:fixture.retained,queries:fixture.tabQueries.slice(-2),
+      grants:fixture.permissionOrigins,created:fixture.createdTabs.length})""")
+    assert (state['id'], state['windowId'], state['ref']) == (state['before']['id'], 11, state['before']['ref'])
+    assert state['history'] == state['before']['history']
+    assert state['tabs'] == state['before']['tabs']
+    assert state['generation'] == state['before']['generation'] + 1
+    assert state['cancelled'] is False
+    assert state['fresh'] is True
+    assert state['allowNewDocument'] is True
+    assert state['created'] == 1
+    assert state['queries'] == [{'active': True, 'windowId': 11}] * 2
+    assert state['grants'] == [['https://employer-fixture.example/*']]
+
+
+@pytest.mark.parametrize('mutation,expected', [
+    ('fixture.activeTabId=7', 'tab_changed'),
+    ('fixture.tabData.get(driver.tabId).windowId=22', 'tab_changed'),
+    ('fixture.ownedWindowClosed=true', 'tab_changed'),
+    ("fixture.tabData.get(driver.tabId).url='https://other-fixture.example/'", 'stale_snapshot'),
+    ("fixture.tabData.get(driver.tabId).url='file:///private/example'", 'unsafe_url'),
+])
+def test_permission_resume_rejects_changed_target_before_request(actor, mutation, expected):
+    waiting_permission_driver(actor)
+    actor.evaluate(f'() => {{ {mutation}; }}')
+    assert actor.evaluate("async () => { try { await driver.resumeAfterPermission(fixture.permissionSignal.signal); } catch(error) { return error.code; } }") == expected
+    assert actor.evaluate('() => fixture.permissionOrigins') == []
+    assert actor.evaluate('() => driver.cancelled') is True
+
+
+@pytest.mark.parametrize('response,expected', [
+    ('return false;', 'site_access_required'),
+    ('return true;', 'permission_review_required'),
+    ("fixture.tabData.get(driver.tabId).url='https://other-fixture.example/'; return true;", 'stale_snapshot'),
+    ('fixture.activeTabId=7; return true;', 'tab_changed'),
+])
+def test_permission_response_cannot_rearm_without_exact_browser_confirmation(actor, response, expected):
+    waiting_permission_driver(actor)
+    actor.evaluate("response => { chrome.permissions.request = async options => { fixture.permissionOrigins.push(options.origins); return await new Function(response)(); }; }", response)
+    assert actor.evaluate("async () => { try { await driver.resumeAfterPermission(fixture.permissionSignal.signal); } catch(error) { return error.code; } }") == expected
+    assert actor.evaluate('() => driver.cancelled') is True
+    assert actor.evaluate('() => driver.generation===fixture.retained.generation') is True
+    assert actor.evaluate('() => fixture.createdTabs.length') == 1
+
+
+@pytest.mark.parametrize('interruption', ['signal', 'cancel', 'new_binding'])
+def test_late_permission_approval_cannot_revive_cancelled_or_replaced_driver(actor, interruption):
+    waiting_permission_driver(actor)
+    actor.evaluate("""() => {
+      chrome.permissions.request = options => {
+        fixture.permissionOrigins.push(options.origins);
+        return new Promise(resolve => { fixture.approvePermission = resolve; });
+      };
+      window.permissionResult = driver.resumeAfterPermission(fixture.permissionSignal.signal)
+        .then(value=>({value}), error=>({name:error.name}));
+    }""")
+    actor.wait_for_function('() => typeof fixture.approvePermission === "function"')
+    if interruption == 'signal':
+        actor.evaluate('() => fixture.permissionSignal.abort()')
+    elif interruption == 'cancel':
+        actor.evaluate('() => driver.cancel()')
+    else:
+        actor.evaluate('async () => { fixture.activeTabId=7; await driver.bindCurrentTab(); }')
+    actor.evaluate('() => { fixture.tabData.get(fixture.retained.id).url=fixture.resumeURL; fixture.approvePermission(true); }')
+    assert actor.evaluate('() => permissionResult') == {'name': 'AbortError'}
+    if interruption == 'new_binding':
+        assert actor.evaluate('() => driver.tabId') == 7
+        assert actor.evaluate('() => driver.tabRef!==fixture.retained.ref') is True
+        assert actor.evaluate('() => driver.cancelled') is False
+    else:
+        assert actor.evaluate('() => driver.cancelled') is True
+    assert actor.evaluate('() => fixture.createdTabs.length') == 1
+
+
+def test_explicit_review_stages_disclosed_public_website_without_grant_or_replay(actor):
+    waiting_permission_driver(actor)
+    actual = HOME.replace('browser-fixture', 'reviewed-fixture') + 'jobs/role'
+    actor.evaluate("url => { fixture.tabData.get(driver.tabId).url=url; chrome.permissions.request=async options=>{fixture.permissionOrigins.push(options.origins);return true;}; }", actual)
+    assert actor.evaluate('() => driver.reviewPermissionTarget(fixture.permissionSignal.signal)') == {'url': actual, 'origin': 'https://reviewed-fixture.example'}
+    assert actor.evaluate('() => fixture.permissionOrigins') == []
+    assert actor.evaluate('() => driver.cancelled') is True
+    assert actor.evaluate('() => fixture.createdTabs.length') == 1
+    assert actor.evaluate('() => driver.resumeAfterPermission(fixture.permissionSignal.signal)') is True
+    assert actor.evaluate('() => fixture.permissionOrigins') == [['https://reviewed-fixture.example/*']]
+    assert actor.evaluate('() => driver.taskTabs.get(driver.tabRef).url') == actual
+    assert actor.evaluate('() => driver.pendingOrigin') == 'https://reviewed-fixture.example'
+    assert actor.evaluate('() => driver.permissionReview') is None
+    assert actor.evaluate('() => driver.history') == actor.evaluate('() => fixture.retained.history')
+    assert actor.evaluate('() => driver.tabRef') == actor.evaluate('() => fixture.retained.ref')
+
+
+@pytest.mark.parametrize('mutation,expected', [
+    ('', 'permission_review_required'),
+    ('fixture.activeTabId=7;', 'tab_changed'),
+    ('fixture.tabData.get(driver.tabId).windowId=22;', 'tab_changed'),
+    ("fixture.tabData.get(driver.tabId).url='http://localhost/';", 'unsafe_url'),
+    ("fixture.tabData.get(driver.tabId).url='https://127.0.0.1/';", 'unsafe_url'),
+])
+def test_review_requires_disclosed_public_url_on_exact_owned_tab(actor, mutation, expected):
+    waiting_permission_driver(actor)
+    actor.evaluate(f'() => {{ {mutation} }}')
+    assert actor.evaluate('async () => { try { await driver.reviewPermissionTarget(fixture.permissionSignal.signal); } catch(error) { return error.code; } }') == expected
+    assert actor.evaluate('() => driver.permissionReview') is None
+    assert actor.evaluate('() => fixture.permissionOrigins') == []
+    assert actor.evaluate('() => driver.cancelled') is True
+
+
+@pytest.mark.parametrize('phase', ['before', 'after'])
+def test_reviewed_exact_url_is_revalidated_before_and_after_permission(actor, phase):
+    waiting_permission_driver(actor)
+    actor.evaluate("() => { fixture.tabData.get(driver.tabId).url=fixture.resumeURL; }")
+    actor.evaluate('() => driver.reviewPermissionTarget(fixture.permissionSignal.signal)')
+    if phase == 'before':
+        actor.evaluate("() => { fixture.tabData.get(driver.tabId).url += '/changed'; }")
+    else:
+        actor.evaluate("() => { chrome.permissions.request=async options=>{fixture.permissionOrigins.push(options.origins);fixture.tabData.get(driver.tabId).url+='/changed';return true;}; }")
+    assert actor.evaluate('async () => { try { await driver.resumeAfterPermission(fixture.permissionSignal.signal); } catch(error) { return error.code; } }') == 'stale_snapshot'
+    assert actor.evaluate('() => fixture.permissionOrigins.length') == (0 if phase == 'before' else 1)
+    assert actor.evaluate('() => driver.cancelled') is True
+
+
+def test_disclosure_revoked_after_review_does_not_request_or_preserve_recovery(actor):
+    waiting_permission_driver(actor)
+    actor.evaluate("() => { fixture.tabData.get(driver.tabId).url=fixture.resumeURL; }")
+    actor.evaluate('() => driver.reviewPermissionTarget(fixture.permissionSignal.signal)')
+    actor.evaluate('() => { fixture.tabData.get(driver.tabId).url=undefined; }')
+    assert actor.evaluate('async () => { try { await driver.resumeAfterPermission(fixture.permissionSignal.signal); } catch(error) { return error.code; } }') == 'site_access_required'
+    assert actor.evaluate('() => fixture.permissionOrigins') == []
+    assert actor.evaluate('() => driver.cancelled') is True
+
+
+@pytest.mark.parametrize('interruption', ['signal', 'cancel', 'new_binding'])
+def test_late_review_cannot_stage_website_after_stop_or_new_binding(actor, interruption):
+    waiting_permission_driver(actor)
+    actor.evaluate("""() => {
+      fixture.queryBeforeReview = chrome.tabs.query;
+      chrome.tabs.query = options => new Promise(resolve => { fixture.finishReview=resolve; });
+      window.reviewResult=driver.reviewPermissionTarget(fixture.permissionSignal.signal)
+        .then(value=>({value}),error=>({name:error.name}));
+    }""")
+    actor.wait_for_function('() => typeof fixture.finishReview === "function"')
+    if interruption == 'signal':
+        actor.evaluate('() => fixture.permissionSignal.abort()')
+    elif interruption == 'cancel':
+        actor.evaluate('() => driver.cancel()')
+    else:
+        actor.evaluate('async () => { chrome.tabs.query=fixture.queryBeforeReview;fixture.activeTabId=7;await driver.bindCurrentTab(); }')
+    actor.evaluate("() => fixture.finishReview([{id:fixture.retained.id,windowId:fixture.retained.windowId,url:fixture.resumeURL}])")
+    assert actor.evaluate('() => reviewResult') == {'name': 'AbortError'}
+    assert actor.evaluate('() => driver.permissionReview') is None
+    assert actor.evaluate('() => fixture.permissionOrigins') == []
+
+
 def test_driver_targets_one_main_frame_document_and_never_retargets(actor):
     load_driver(actor)
     snapshot = actor.evaluate("() => driver.observe()")

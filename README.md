@@ -10,6 +10,8 @@ An open-source Chrome side-panel agent built with LangChain Core and LangGraph.j
 flowchart TD
   Task[Task and explicitly selected Chrome tab] --> Bind[Bind task-owned browser scope]
   Bind --> Observe[Observe visible page and controls]
+  Observe -->|site access needed| Permission[Pause for exact-site approval]
+  Permission -->|Allow and continue| Observe
   Observe --> Route[Tev1 selects a configured LLM and strategy]
   Route --> Plan[Chat LLM proposes one typed action]
   Plan --> Judge[Tev1 reviews the proposal]
@@ -21,7 +23,7 @@ flowchart TD
   Capture -->|done or limit| Finish
 ```
 
-LangGraph owns the nodes, state and conditional loop. LangChain structured tools execute reviewed browser actions through the packaged Chrome driver. The model adapter retains bounded direct requests to local Ollama. Framework code is bundled into the extension; there is no orchestration backend, relay proxy or hosted LangGraph service.
+LangGraph owns the nodes, state and conditional loop. An in-memory checkpointer and native checkpoint breakpoint preserve a mission while it waits for exact-site approval; the explicit continue action resumes that same graph and observes the page again. Confirmed browser actions are not replayed. This uses the pinned web build's documented static breakpoint and null-input continuation; its dynamic interrupt API requires async context that this browser build does not provide. LangChain structured tools execute reviewed browser actions through the packaged Chrome driver. The model adapter retains bounded direct requests to local Ollama. Framework code is bundled into the extension; there is no orchestration backend, relay proxy or hosted LangGraph service.
 
 
 TypeSafe's [Jev 1.14](https://docs.typesafe.ai/models) is a decision model. [Together AI's Tev1](https://ollama.com/library/tev1) is a separate experimental Jev-inspired decision model available through Ollama. This release uses local Tev1 through `/v1/systemone`; it does not include TypeSafe's model weights or call its hosted API. The decision model selects registered choices and reviews actions; a configured chat LLM proposes the action arguments.
@@ -36,7 +38,9 @@ The extension supports public web search, observed links, clicking, paced DOM ty
 4. Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select this folder containing `manifest.json`.
 5. Copy the extension ID from its card. Configure Ollama to allow that exact extension origin, following the [Ollama FAQ](https://docs.ollama.com/faq). When running Ollama from a terminal, the origin setting is `OLLAMA_ORIGINS=chrome-extension://YOUR_EXTENSION_ID`. Restart your Ollama service with that setting. Preserve any other explicitly trusted origins already required by your setup.
 6. Pin Ollama Copilot, open a public website, and click the extension icon. In Settings, check the endpoint and model choices, then choose **Check models**.
-7. Enter a task and select **Start on this tab**. Use **Allow this website** when a site grant is needed. Stop ends inference and disconnects the execution channel. Reopening the panel marks unfinished work interrupted; actions are never replayed automatically.
+7. Enter a task and select **Start on this tab**. Use **Allow and continue** if an ongoing task pauses at a new website. This grants access only to the displayed origin and lets the same mission make its next decision. **Allow this website** is also available before starting. Stop ends inference and disconnects the execution channel. Closing or reopening the panel interrupts unfinished work; its saved evidence remains viewable, but executable ownership is not restored and actions are never replayed automatically.
+
+If a page redirects and Chrome hides its new address, Copilot keeps the mission waiting. Click its toolbar icon on the visible page, select **Review current website**, check the displayed public origin, then select **Allow and continue**. That explicit review authorizes the current page; Copilot observes it again before deciding what to do next. A denied request, changed task ownership, Stop or panel reload cannot silently resume browser actions.
 
 The extension accepts only loopback Ollama endpoints and rejects models advertised as remote/cloud-backed. The endpoint defaults to the standard local Ollama service. No Python backend, API key or separate Node server is required after the extension is built.
 
@@ -52,14 +56,16 @@ Start on the Python documentation and ask:
 
 For job research:
 
-> Find senior AI/backend roles in Israel. Search indexed listings, open an observed job link in a new task-owned tab, read accessible employer career pages, and capture the role title, location and source text. Keep details that are missing marked unknown. Stop at login, challenge or application steps.
+> Find a senior AI or backend engineering job in Israel and research its location and requirements from the employer's career page. Capture the source for the result.
+
+Start on a blank search page. This goal leaves the query, employer and browsing decisions to the model. Chrome may still need your approval for a newly encountered website; approving access does not choose a job for the model.
 
 LinkedIn and Glassdoor may require sign-in or restrict automated access. See their [LinkedIn policy](https://www.linkedin.com/help/linkedin/answer/a1340567/automated-activity-on-linkedin?lang=en) and [Glassdoor terms](https://www.glassdoor.com/about/terms/). Search discovery and accessible employer pages are supported paths; unrestricted automation of those boards is not promised. This release does not submit applications, messages, uploads or account changes.
 
 ## Data and permissions
 
 - `activeTab` binds access to a tab you explicitly invoke. A run starts on that tab and can open an observed public reading link in a new task-owned tab. It can switch only among its own recorded tabs; unrelated user tabs remain outside the run.
-- Additional site access is optional and requested for an exact origin through a user gesture. A cross-origin navigation can require a new grant.
+- Additional site access is optional and requested for an exact origin through a user gesture. A cross-origin navigation can require a new grant. Only a safe observation-time access pause can be continued in the same open panel; uncertain actions and ownership changes cannot be resumed.
 - The LangGraph workflow runs in the visible panel. Its service worker only handles short Chrome events. Stop aborts model work and closes the execution channel; completed tab actions are never retried automatically.
 - Model requests go to the configured local Ollama endpoint. No analytics or remote scripts are included.
 - Settings stay in trusted local extension storage. Bounded run checkpoints remain in trusted session storage. Captures leave that session only when you export them or choose to transmit them through another tool.

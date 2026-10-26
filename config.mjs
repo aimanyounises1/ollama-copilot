@@ -6,7 +6,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 });
 export const LIMITS = Object.freeze({
   maxSteps: 30, maxTypingDelayMs: 250, maxRequestTimeoutMs: 300000, maxGoalChars: 2000,
-  decisionGoalChars: 800, maxSourceChars: 20000, maxObservationChars: 1600, decisionObservationChars: 600,
+  decisionGoalChars: 800, maxSourceChars: 20000, maxObservationChars: 8000, decisionObservationChars: 600,
   maxControls: 40, maxLabelChars: 160, maxTitleChars: 200, maxHistory: 12, maxModelNameChars: 200,
   maxModels: 200, maxUrlChars: 4096, maxSnapshotChars: 128, maxTargetChars: 64, maxActionText: 1000,
   maxSearchQuery: 500, maxReasonChars: 240, maxRequestBytes: 65536, maxResponseBytes: 262144,

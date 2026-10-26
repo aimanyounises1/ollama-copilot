@@ -27,6 +27,7 @@ export class BrowserDriver {
     this.taskTabs = new Map();
     this.tabRef = null;
     this.windowId = null;
+    this.permissionReview = null;
   }
 
   _saveTab() {
@@ -84,6 +85,84 @@ export class BrowserDriver {
       startUrl: this.startUrl, history: this.history, lastDocumentId: null,
       pendingOrigin: null, allowNewDocument: true }]]);
     return { tabId: this.tabId, url: this.startUrl, title, tab_ref: this.tabRef, tabs: this._tabMetadata() };
+  }
+
+  /** A live registry is required; stored checkpoints cannot recreate this capability. */
+  get canContinuePermission() {
+    const tab = this.taskTabs.get(this.tabRef);
+    if (!Number.isInteger(this.tabId) || !Number.isInteger(this.windowId) || !tab || tab.id !== this.tabId || tab.ref !== this.tabRef) return false;
+    try { safePublicUrl(this.pendingOrigin || tab.url); return true; }
+    catch { return false; }
+  }
+
+  /** Stage only Chrome's disclosed URL after an explicit current-website review. */
+  async reviewPermissionTarget(signal) {
+    if (!signal || typeof signal.throwIfAborted !== "function") throw new TypeError("A task cancellation signal is required.");
+    signal.throwIfAborted();
+    if (!this.cancelled || !this.canContinuePermission) throw new BrowserDriverError("not_bound", "This panel no longer owns a permission continuation.");
+    this.permissionReview = null;
+    const generation = this.generation;
+    const tabId = this.tabId, windowId = this.windowId, tabRef = this.tabRef;
+    const guard = () => {
+      signal.throwIfAborted();
+      if (!this.cancelled || this.generation !== generation || this.tabId !== tabId || this.windowId !== windowId || this.tabRef !== tabRef || !this.canContinuePermission) throw abortError();
+    };
+    let tabs;
+    try { tabs = await this.chrome.tabs.query({ active: true, windowId }); }
+    catch { guard(); throw new BrowserDriverError("tab_unavailable", "The task window is no longer available."); }
+    guard();
+    const tab = tabs[0];
+    if (!tab || tab.id !== tabId || tab.windowId !== windowId) throw new BrowserDriverError("tab_changed", "The task's active tab changed. Review it before starting a new task.");
+    if (!tab.url) throw new BrowserDriverError("permission_review_required", "Click Ollama Copilot's toolbar icon on the current task page, then choose Review current website.");
+    const url = safePublicUrl(tab.url), origin = new URL(url).origin;
+    this.permissionReview = { url, origin, generation, tabId, windowId, tabRef };
+    return { url, origin };
+  }
+
+  /** Grant exactly the retained public origin, then rearm only the same task tab. */
+  async resumeAfterPermission(signal) {
+    if (!signal || typeof signal.throwIfAborted !== "function") throw new TypeError("A task cancellation signal is required.");
+    signal.throwIfAborted();
+    if (!this.cancelled || !this.canContinuePermission) throw new BrowserDriverError("not_bound", "This panel no longer owns a permission continuation.");
+    const generation = this.generation;
+    const tabId = this.tabId, windowId = this.windowId, tabRef = this.tabRef;
+    const reviewed = this.permissionReview;
+    if (reviewed && (reviewed.generation !== generation || reviewed.tabId !== tabId || reviewed.windowId !== windowId || reviewed.tabRef !== tabRef)) throw abortError();
+    const origin = reviewed?.origin || new URL(safePublicUrl(this.pendingOrigin || this.taskTabs.get(tabRef).url)).origin;
+    const guard = () => {
+      signal.throwIfAborted();
+      if (!this.cancelled || this.generation !== generation || this.tabId !== tabId || this.windowId !== windowId || this.tabRef !== tabRef || !this.canContinuePermission) throw abortError();
+    };
+    const active = async (requireUrl, grantConfirmed = false) => {
+      let tabs;
+      try { tabs = await this.chrome.tabs.query({ active: true, windowId }); }
+      catch { guard(); throw new BrowserDriverError("tab_unavailable", "The task window is no longer available."); }
+      guard();
+      const tab = tabs[0];
+      if (!tab || tab.id !== tabId || tab.windowId !== windowId) throw new BrowserDriverError("tab_changed", "Return to the task's own tab before continuing.");
+      if (tab.url && new URL(safePublicUrl(tab.url)).origin !== origin) throw new BrowserDriverError("stale_snapshot", "The task tab moved to a different website. Start a new task after reviewing it.");
+      if (tab.url && reviewed && safePublicUrl(tab.url) !== reviewed.url) throw new BrowserDriverError("stale_snapshot", "The reviewed task page changed. Start a new task after reviewing it.");
+      if (requireUrl && !tab.url) throw new BrowserDriverError(grantConfirmed ? "permission_review_required" : "site_access_required", "Chrome still hides the current website. Click Ollama Copilot's toolbar icon on that page, then choose Review current website.");
+      return tab;
+    };
+    await active(reviewed !== null);
+    guard();
+    const url = new URL(origin);
+    let granted;
+    try { granted = await this.chrome.permissions.request({ origins: [`${url.protocol}//${url.hostname}/*`] }); }
+    catch { guard(); throw new BrowserDriverError("site_access_required", "Chrome could not grant access to this task website."); }
+    guard();
+    if (!granted) throw new BrowserDriverError("site_access_required", "Website access was not granted. This task remains stopped.");
+    const tab = await active(true, true);
+    guard();
+    this._closePort(new BrowserDriverError("stale_snapshot", "A fresh observation is required after website approval."));
+    this.generation += 1; this.cancelled = false; this.allowNewDocument = true;
+    this.pendingOrigin = origin; this.permissionReview = null;
+    const current = this.taskTabs.get(tabRef);
+    current.url = safePublicUrl(tab.url);
+    current.title = String(tab.title || current.title).slice(0, MAX_CONTROL_LABEL);
+    this._saveTab();
+    return true;
   }
 
   async grantCurrentSite() {
@@ -385,12 +464,19 @@ export class BrowserDriver {
       }
       if (this.cancelled) throw abortError();
       if (action.kind === "back") this.history.pop();
+      if (result.navigation === true) {
+        const current = this.taskTabs.get(this.tabRef);
+        current.url = safePublicUrl(result.destination);
+        current.title = "New reading page";
+      }
       this._saveTab();
-      return result;
+      return result.navigation === true ? { ...result, url: this.taskTabs.get(this.tabRef).url,
+        title: this.taskTabs.get(this.tabRef).title, tab_ref: this.tabRef, tabs: this._tabMetadata() } : result;
     } finally { navigation?.close(); }
   }
 
   cancel() {
+    this.permissionReview = null;
     this.cancelled = true;
     this.generation += 1;
     for (const waiter of [...this.waiters]) { waiter.cleanup(); waiter.reject(abortError()); }

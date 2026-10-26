@@ -112,6 +112,21 @@ test("captures are bounded and never replace observed text with a browser reply"
   assert.ok(!state.report.includes("Invented salary"));
 });
 
+test("report retains late requirements from the complete bounded source without changing its hash", async () => {
+  const raw = "Header\n" + "x".repeat(6000) + "\nRequirements: Python and distributed systems. Location: Israel.\n<script>literal</script> [link](unsafe)\n" + "y".repeat(CAPTURE_LIMITS.maxChars) + "\nAFTER_CAPTURE_BOUNDARY";
+  const f = fixture({ contents: [raw] });
+  const state = await f.run.start("Read the individual role and its requirements");
+  const source = { ...state.sources[0] };
+  assert.equal(source.text.length, CAPTURE_LIMITS.maxChars);
+  assert.equal(source.contentHash, "c067b7c6feb8a73242e86da5bd68592f7f103fa062b7254b6cf9caa856c7f701");
+  assert.ok(state.report.includes("Requirements: Python and distributed systems. Location: Israel."));
+  assert.ok(state.report.includes("&lt;script&gt;literal&lt;/script&gt;"));
+  assert.ok(!state.report.includes("<script>"));
+  assert.ok(!state.report.includes("AFTER_CAPTURE_BOUNDARY"));
+  assert.equal(createReport(state), state.report);
+  assert.deepEqual(state.sources[0], source);
+});
+
 test("capture navigation mismatch fails while retaining confirmed action outcome", async () => {
   const f = fixture();
   f.driver.execute = async () => ({ status: "executed", url: "https://careers.fixture.example/other" });
