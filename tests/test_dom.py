@@ -58,7 +58,12 @@ CHROME_TRANSPORT = r"""
    title: document.title, status: fixture.loading ? 'loading' : 'complete'};
  window.chrome = {
    runtime: { id: 'fixture-extension', getURL: path => 'chrome-extension://fixture-extension/' + path, onConnect: connected, lastError: null },
-   tabs: { query: async () => [fixture.tab(fixture.activeTabId)],
+   tabs: { query: async options => {
+       (fixture.tabQueries ||= []).push({...options});
+       if (options.lastFocusedWindow && fixture.foreignWindowFocused) return [{id:99,windowId:22,status:'complete'}];
+       if (options.windowId !== undefined && (options.windowId !== fixture.windowId || fixture.ownedWindowClosed)) return [];
+       return [fixture.tab(fixture.activeTabId)];
+     },
      get: async id => fixture.tab(id), onUpdated: updated,
      create: async options => {
        fixture.createdTabs.push(options);
@@ -360,6 +365,58 @@ def test_direct_file_control_target_still_requires_manual_handling(actor):
     assert actor.evaluate("() => document.querySelector('#aux-file').files.length") == 0
 
 
+@pytest.mark.parametrize("control", ["button-default", "button-submit", "input-submit"])
+def test_exact_google_search_submit_label_runs_observed_get_query(actor, control):
+    actor.evaluate("""control => {
+        const original=document.querySelector('#go');
+        if (control === 'input-submit') {
+            const submit=document.createElement('input'); submit.id='go'; submit.type='submit';
+            submit.name='btnK'; submit.value='Google Search'; original.replaceWith(submit);
+        } else {
+            original.textContent='Google Search';
+            if (control === 'button-submit') original.type='submit';
+        }
+    }""", control)
+    first = observation(actor)
+    assert execute(actor, action_for(first, "type", "Search jobs", text="backend Israel"))["status"] == "executed"
+    current = observation(actor)
+    assert execute(actor, action_for(current, "click", "Google Search"))["navigation"] is True
+    actor.wait_for_url("**/search?**")
+    expected = {"q": ["backend Israel"], "area": ["default"]}
+    if control == "input-submit":
+        expected["btnK"] = ["Google Search"]
+    assert parse_qs(urlsplit(actor.url).query) == expected
+
+
+@pytest.mark.parametrize("boundary", ["post", "submit-post", "new-window", "non-form", "non-submit"])
+def test_google_search_label_does_not_bypass_form_boundaries(actor, boundary):
+    actor.evaluate("""boundary => {
+        const button=document.querySelector('#go'); button.textContent='Google Search';
+        fixture.searchClicks=0; button.onclick=() => fixture.searchClicks++;
+        if (boundary === 'post') button.form.method='post';
+        if (boundary === 'submit-post') button.setAttribute('formmethod','post');
+        if (boundary === 'new-window') button.setAttribute('formtarget','_blank');
+        if (boundary === 'non-form') document.querySelector('main').append(button);
+        if (boundary === 'non-submit') button.type='button';
+    }""", boundary)
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "click", "Google Search"))["code"] == "manual_review"
+    assert actor.evaluate("() => fixture.searchClicks") == 0
+    assert actor.url == HOME
+
+
+@pytest.mark.parametrize("label", ["Google Search Save", "Google Search Delete", "Google Search settings"])
+def test_google_search_submit_label_is_exact_and_sensitive_controls_stay_blocked(actor, label):
+    actor.evaluate("""label => {
+        const button=document.querySelector('#go'); button.textContent=label;
+        fixture.searchClicks=0; button.onclick=() => fixture.searchClicks++;
+    }""", label)
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "click", label))["code"] == "manual_review"
+    assert actor.evaluate("() => fixture.searchClicks") == 0
+    assert actor.url == HOME
+
+
 def test_link_click_uses_observed_public_destination(actor):
     snapshot = observation(actor)
     result = execute(actor, action_for(snapshot, "click", "Documentation"))
@@ -434,6 +491,58 @@ def load_driver(page):
       window.driver = new BrowserDriver({maxSteps:12,typingDelayMs:0,requestTimeoutMs:30000,searchUrl:'https://search-fixture.example/search',searchParameter:'q'});
       await driver.bindCurrentTab();
     }""")
+
+
+def test_driver_binds_owning_window_and_keeps_it_when_another_window_is_focused(actor):
+    actor.evaluate("() => { fixture.foreignWindowFocused=true; }")
+    load_driver(actor)
+    assert actor.evaluate("() => driver.tabId") == 7
+    assert actor.evaluate("() => driver.windowId") == 11
+    assert actor.evaluate("() => fixture.tabQueries[0]") == {"active": True, "currentWindow": True}
+    assert actor.evaluate("() => driver.observe()")["url"] == HOME
+    assert actor.evaluate("() => fixture.tabQueries.at(-1)") == {"active": True, "windowId": 11}
+    assert actor.evaluate("() => driver.grantCurrentSite()") is True
+    assert actor.evaluate("() => fixture.permissionOrigins") == [["https://browser-fixture.example/*"]]
+    assert actor.evaluate("() => fixture.tabQueries.at(-1)") == {"active": True, "windowId": 11}
+
+
+def test_unbound_website_grant_uses_owning_window_instead_of_foreign_focus(actor):
+    actor.evaluate("""async () => {
+        fixture.foreignWindowFocused=true;
+        const {BrowserDriver}=await import('/extension/browser-driver.mjs');
+        window.driver=new BrowserDriver({});
+    }""")
+    assert actor.evaluate("() => driver.grantCurrentSite()") is True
+    assert actor.evaluate("() => fixture.tabQueries") == [{"active": True, "currentWindow": True}]
+    assert actor.evaluate("() => fixture.permissionOrigins") == [["https://browser-fixture.example/*"]]
+
+
+def test_owned_window_manual_tab_switch_or_close_stops_without_using_foreign_window(actor):
+    load_driver(actor)
+    actor.evaluate("() => { fixture.foreignWindowFocused=true; fixture.activeTabId=8; }")
+    assert actor.evaluate("async () => { try { await driver.observe(); } catch(error) { return error.code; } }") == "tab_changed"
+    assert actor.evaluate("async () => { try { await driver.grantCurrentSite(); } catch(error) { return error.code; } }") == "tab_changed"
+    assert actor.evaluate("() => fixture.permissionOrigins") == []
+    actor.evaluate("() => { fixture.activeTabId=7; fixture.ownedWindowClosed=true; }")
+    assert actor.evaluate("async () => { try { await driver.observe(); } catch(error) { return error.code; } }") == "tab_changed"
+    assert actor.evaluate("() => fixture.tabQueries.slice(1).every(query => query.windowId === 11 && !query.lastFocusedWindow)") is True
+
+
+def test_delayed_owning_window_bind_cannot_replace_a_newer_binding(actor):
+    actor.evaluate("""async () => {
+        const {BrowserDriver}=await import('/extension/browser-driver.mjs');
+        window.driver=new BrowserDriver({}); fixture.bindQueries=[];
+        chrome.tabs.query=options => new Promise(resolve => fixture.bindQueries.push({options,resolve}));
+        window.oldBind=driver.bindCurrentTab().then(value=>({value}),error=>({name:error.name}));
+        window.newBind=driver.bindCurrentTab().then(value=>({value}),error=>({name:error.name}));
+    }""")
+    actor.evaluate("() => fixture.bindQueries[1].resolve([{...fixture.tab(8),id:8}])")
+    assert actor.evaluate("() => newBind")["value"]["tabId"] == 8
+    actor.evaluate("() => fixture.bindQueries[0].resolve([fixture.tab(7)])")
+    assert actor.evaluate("() => oldBind") == {"name": "AbortError"}
+    assert actor.evaluate("() => driver.tabId") == 8
+    assert actor.evaluate("() => driver.windowId") == 11
+    assert actor.evaluate("() => fixture.bindQueries.every(query => query.options.currentWindow === true)") is True
 
 
 def test_driver_targets_one_main_frame_document_and_never_retargets(actor):
@@ -671,6 +780,59 @@ def test_driver_does_not_confirm_an_action_when_its_document_disconnects_before_
     assert actor.evaluate("() => unconfirmed") == {"code": "document_disconnected"}
     assert actor.evaluate("() => fixture.updated.handlers.size") == 0
 
+
+
+def test_unpacked_driver_uses_extension_owning_window_when_another_window_has_focus(tmp_path, playwright_runtime):
+    """Real Chrome windows and queries in a disposable extension profile."""
+    fixture_home = "http://window-fixture.example/"
+    unpacked = shutil.copytree(ROOT, tmp_path / "window-extension", ignore=shutil.ignore_patterns("tests", "node_modules", "__pycache__", ".pytest_cache", ".git", ".venv", ".test-venv"))
+    manifest_path = unpacked / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["host_permissions"].append(fixture_home + "*")
+    manifest_path.write_text(json.dumps(manifest))
+    context = playwright_runtime.chromium.launch_persistent_context(
+        tmp_path / "window-profile", channel="chromium", headless=True,
+        args=[f"--disable-extensions-except={unpacked}", f"--load-extension={unpacked}"],
+    )
+    try:
+        context.set_default_timeout(TIMEOUT_MS)
+        context.route(fixture_home + "**", lambda route: route.fulfill(body=HTML, content_type="text/html"))
+        workers = context.service_workers
+        worker = workers[0] if workers else context.wait_for_event("serviceworker", timeout=TIMEOUT_MS)
+        extension_id = urlsplit(worker.url).hostname
+        target = context.new_page()
+        target.goto(fixture_home)
+        panel = context.new_page()
+        panel.goto(f"chrome-extension://{extension_id}/sidepanel.html")
+        panel.wait_for_function("() => document.querySelector('#ollama-url').value.startsWith('http://')")
+        result = panel.evaluate("""async home => {
+            const owner=await chrome.windows.getCurrent();
+            const [target]=await chrome.tabs.query({url:home+'*'});
+            if (target.windowId !== owner.id) await chrome.tabs.move(target.id,{windowId:owner.id,index:-1});
+            await chrome.tabs.update(target.id,{active:true});
+            const foreign=await chrome.windows.create({url:'about:blank',focused:true});
+            const [lastFocused]=await chrome.tabs.query({active:true,lastFocusedWindow:true});
+            const [owning]=await chrome.tabs.query({active:true,currentWindow:true});
+            const {BrowserDriver}=await import(chrome.runtime.getURL('browser-driver.mjs'));
+            const driver=new BrowserDriver({});
+            const binding=await driver.bindCurrentTab();
+            const current=await driver._activeTab();
+            await chrome.tabs.create({windowId:owner.id,url:'about:blank',active:true});
+            let switched;
+            try { await driver._activeTab(); } catch(error) { switched=error.code; }
+            driver.cancel();
+            return {ownerId:owner.id,foreignId:foreign.id,lastFocusedId:lastFocused.windowId,
+                owningId:owning.windowId,owningUrl:owning.url,bindingId:binding.tabId,
+                expectedId:target.id,currentId:current.id,switched};
+        }""", fixture_home)
+        assert result["ownerId"] != result["foreignId"]
+        assert result["lastFocusedId"] == result["foreignId"]
+        assert result["owningId"] == result["ownerId"]
+        assert result["owningUrl"] == fixture_home
+        assert result["bindingId"] == result["expectedId"] == result["currentId"]
+        assert result["switched"] == "tab_changed"
+    finally:
+        context.close()
 
 
 def test_unpacked_content_actor_supports_insecure_http_without_random_uuid(tmp_path, playwright_runtime):

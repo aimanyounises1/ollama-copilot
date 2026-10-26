@@ -63,7 +63,8 @@ export class BrowserDriver {
     this.cancelled = false;
     const generation = this.generation;
     let tabs;
-    try { tabs = await this.chrome.tabs.query({ active: true, lastFocusedWindow: true }); }
+    // The visible extension page owns this window even when another window has focus.
+    try { tabs = await this.chrome.tabs.query({ active: true, currentWindow: true }); }
     catch { throw new BrowserDriverError("site_access_required", "Click Ollama Copilot's toolbar icon on the website you want it to use."); }
     if (generation !== this.generation) throw abortError();
     const tab = tabs[0];
@@ -88,11 +89,13 @@ export class BrowserDriver {
   async grantCurrentSite() {
     // This method must be called by the panel's explicit permission button.
     let tabs;
-    try { tabs = await this.chrome.tabs.query({ active: true, lastFocusedWindow: true }); }
+    try { tabs = await this.chrome.tabs.query(this.windowId === null
+      ? { active: true, currentWindow: true } : { active: true, windowId: this.windowId }); }
     catch { throw new BrowserDriverError("site_access_required", "Click Ollama Copilot's toolbar icon on this website to grant temporary access."); }
     const tab = tabs[0];
     const target = tab?.url || this.pendingOrigin;
-    if (!target || this.tabId !== null && tab?.id !== this.tabId) {
+    if (!target || this.tabId !== null && tab?.id !== this.tabId ||
+        this.windowId !== null && tab?.windowId !== this.windowId) {
       throw new BrowserDriverError("tab_changed", "Return to the controlled tab or start a new task for the selected tab.");
     }
     const url = new URL(safePublicUrl(target));
@@ -109,7 +112,7 @@ export class BrowserDriver {
     if (!Number.isInteger(this.tabId)) throw new BrowserDriverError("not_bound", "Choose the current tab before starting a browser task.");
     const generation = this.generation;
     let tabs;
-    try { tabs = await this.chrome.tabs.query({ active: true, lastFocusedWindow: true }); }
+    try { tabs = await this.chrome.tabs.query({ active: true, windowId: this.windowId }); }
     catch { throw new BrowserDriverError("tab_unavailable", "The controlled Chrome tab is unavailable."); }
     if (this.cancelled || generation !== this.generation) throw abortError();
     const tab = tabs[0];

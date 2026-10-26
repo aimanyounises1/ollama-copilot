@@ -16,6 +16,7 @@
   const SENSITIVE_TYPES = new Set(["password", "file", "email", "tel", "number", "date", "datetime-local"]);
   const SEARCH_LABEL = /\b(search|query|find|filter|keyword|keywords|job|jobs|role|location|city|country|title)\b/i;
   const READING_BUTTON = /^(?:go|search|find|filter|next|previous|prev|more|show(?: more)?|load more|menu|read|continue reading|learn more)(?:\b|$)/i;
+  const SEARCH_SUBMIT_BUTTON = /^google search$/i;
   const UI_BUTTON = /^(?:open|close)(?:\s+(?:dialog|modal|menu|popover|panel|navigation|tab))?$/i;
   function opaqueId() {
     return Array.from(crypto.getRandomValues(new Uint8Array(TOKEN_BYTES)),
@@ -222,7 +223,9 @@
           navigation = publicUrl(info.href);
           if (element.hasAttribute("download") || SENSITIVE.test(new URL(navigation).pathname)) fail("manual_review", "This link requires manual handling.");
         } else {
-          if (!READING_BUTTON.test(info.label) && !UI_BUTTON.test(info.label)) fail("manual_review", "This button needs manual handling in Chrome.");
+          const publicSearchSubmit = SEARCH_SUBMIT_BUTTON.test(info.label) &&
+            ["button", "input"].includes(info.tag) && element.type === "submit" && element.form;
+          if (!READING_BUTTON.test(info.label) && !UI_BUTTON.test(info.label) && !publicSearchSubmit) fail("manual_review", "This button needs manual handling in Chrome.");
           if (element.form) {
             safeForm(element.form, element);
             nativeNavigation = submitWithNavigation(element.form, () => currentTarget(state, action).click());
