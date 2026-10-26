@@ -323,6 +323,63 @@ def test_stop_cancels_acked_navigation_before_document_readiness(actor):
 
 
 
+def install_worker_fixture(actor, *, reject_configuration=False, reject_open=False):
+    """Execute the packaged worker with observable action and side-panel APIs."""
+    actor.evaluate("""options => {
+        fixture.worker = { handlers: [], behaviors: [], opened: [], errors: [] };
+        console.error = (...args) => fixture.worker.errors.push(args.map(String));
+        chrome.action = { onClicked: { addListener: handler => fixture.worker.handlers.push(handler) } };
+        chrome.sidePanel = {
+            setPanelBehavior: behavior => {
+                fixture.worker.behaviors.push(behavior);
+                if (options.reject_configuration) return Promise.reject(new TypeError('private configuration detail'));
+                return new Promise(resolve => { fixture.worker.finishConfiguration = resolve; });
+            },
+            open: options => {
+                fixture.worker.opened.push(options);
+                return options && fixture.worker.rejectOpen
+                    ? Promise.reject(new TypeError('private opening detail')) : Promise.resolve();
+            },
+        };
+        fixture.worker.rejectOpen = options.reject_open;
+    }""", {"reject_configuration": reject_configuration, "reject_open": reject_open})
+    actor.add_script_tag(content=(ROOT / "background.js").read_text())
+
+
+def test_toolbar_handler_opens_clicked_window_before_configuration_settles(actor):
+    install_worker_fixture(actor)
+    assert actor.evaluate("() => fixture.worker.behaviors") == [{"openPanelOnActionClick": False}]
+    assert actor.evaluate("() => fixture.worker.handlers.length") == 1
+    assert actor.evaluate("""() => {
+        fixture.worker.handlers[0]({windowId:42});
+        return fixture.worker.opened;
+    }""") == [{"windowId": 42}]
+    assert actor.evaluate("() => fixture.worker.errors") == []
+
+
+@pytest.mark.parametrize("tab", [None, {}, {"windowId": None}, {"windowId": "42"}, {"windowId": -1}])
+def test_toolbar_handler_rejects_invalid_window_without_opening(actor, tab):
+    install_worker_fixture(actor)
+    actor.evaluate("tab => fixture.worker.handlers[0](tab)", tab)
+    assert actor.evaluate("() => fixture.worker.opened") == []
+    assert actor.evaluate("() => fixture.worker.errors") == [["Ollama Copilot could not identify the clicked window."]]
+
+
+def test_toolbar_handler_retains_action_and_reports_configuration_failure(actor):
+    install_worker_fixture(actor, reject_configuration=True)
+    actor.wait_for_function("() => fixture.worker.errors.length === 1")
+    actor.evaluate("() => fixture.worker.handlers[0]({windowId:42})")
+    assert actor.evaluate("() => fixture.worker.opened") == [{"windowId": 42}]
+    assert actor.evaluate("() => fixture.worker.errors") == [["Ollama Copilot could not configure its side panel:", "TypeError"]]
+
+
+def test_toolbar_handler_reports_panel_failure_without_sensitive_error_text(actor):
+    install_worker_fixture(actor, reject_open=True)
+    actor.evaluate("() => fixture.worker.handlers[0]({windowId:42})")
+    actor.wait_for_function("() => fixture.worker.errors.length === 1")
+    assert actor.evaluate("() => fixture.worker.errors") == [["Ollama Copilot could not open its side panel:", "TypeError"]]
+
+
 def test_unpacked_extension_loads_real_worker_panel_storage_and_csp(tmp_path, playwright_runtime):
     """Real MV3 APIs in a disposable profile; no permission shim or model call."""
     context = playwright_runtime.chromium.launch_persistent_context(
@@ -341,7 +398,7 @@ def test_unpacked_extension_loads_real_worker_panel_storage_and_csp(tmp_path, pl
         panel.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
         panel.goto(f"chrome-extension://{extension_id}/sidepanel.html")
         panel.wait_for_function("() => document.querySelector('#ollama-url').value.startsWith('http://')")
-        panel.wait_for_function("async () => (await chrome.sidePanel.getPanelBehavior()).openPanelOnActionClick === true")
+        panel.wait_for_function("async () => (await chrome.sidePanel.getPanelBehavior()).openPanelOnActionClick === false")
         assert panel.locator("#goal").is_enabled()
         assert panel.evaluate("""async () => {
             await chrome.storage.local.set({smoke:'local'});

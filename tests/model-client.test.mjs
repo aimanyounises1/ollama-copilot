@@ -58,10 +58,52 @@ test("router maps registered labels to exact installed chat models", async () =>
   for (const call of calls) { assert.equal(call.init.redirect, "error"); assert.equal(call.init.credentials, "omit"); assert.equal(new URL(call.url).hostname, "127.0.0.1"); }
 });
 
-test("uncertain model or tool choice has an explicit strong/read fallback", async () => {
-  for (const options of [{ modelChoice: pick("fast", ["fast", "strong"], 0.05) }, { toolChoice: pick("search", ["read", "interact", "search"], 0.05) }]) {
-    const route = await fixture(options).client.route("Read", OBSERVATION); assert.equal(route.model, TEST_SETTINGS.strongModel); assert.equal(route.tool, "read"); assert.ok(route.fallbackReason);
+test("uncertain model tier retains a separately accepted browser interaction", async () => {
+  const modelChoice = { type: "choice", choice: "strong", probabilities: { fast: 0.34434697338116177, strong: 0.6556530266188383 }, confidence: 0.07108215887248515 };
+  const toolChoice = { type: "choice", choice: "interact", probabilities: { read: 0.0011520031510168305, interact: 0.5678329706592893, search: 0.43101502618969384 }, confidence: 0.3702101546158041 };
+  for (const settings of [{}, { strongModel: TEST_SETTINGS.fastModel }]) {
+    const { client, calls } = fixture({ modelChoice, toolChoice, settings });
+    const route = await client.route("Search for public backend jobs", OBSERVATION);
+    assert.equal(route.modelRole, "strong");
+    assert.equal(route.model, settings.strongModel || TEST_SETTINGS.strongModel);
+    assert.equal(route.tool, "interact");
+    assert.equal(route.confidence, modelChoice.confidence);
+    assert.match(route.fallbackReason, /Model selection was uncertain/);
+    assert.match(route.fallbackReason, /Retain the selected interact strategy/);
+    assert.equal((await client.propose("Search for public backend jobs", OBSERVATION, [], route)).kind, "type");
+    assert.ok(calls.find(call => call.path === ENDPOINTS.chat).payload.format.properties.kind.enum.includes("type"));
   }
+});
+
+test("uncertain tool selects read without changing an accepted model tier", async () => {
+  for (const modelRole of ["fast", "strong"]) {
+    const modelChoice = pick(modelRole, ["fast", "strong"]);
+    const toolChoice = pick("search", ["read", "interact", "search"], 0.05);
+    const route = await fixture({ modelChoice, toolChoice }).client.route("Read public evidence", OBSERVATION);
+    assert.equal(route.modelRole, modelRole);
+    assert.equal(route.model, modelRole === "fast" ? TEST_SETTINGS.fastModel : TEST_SETTINGS.strongModel);
+    assert.equal(route.tool, "read");
+    assert.equal(route.confidence, toolChoice.confidence);
+    assert.equal(route.fallbackReason, "Tool selection was uncertain; use the read strategy.");
+  }
+});
+
+test("independent fallbacks both apply when model and tool are uncertain", async () => {
+  const route = await fixture({ modelChoice: pick("fast", ["fast", "strong"], 0.05), toolChoice: pick("interact", ["read", "interact", "search"], 0.05) }).client.route("Read", OBSERVATION);
+  assert.equal(route.model, TEST_SETTINGS.strongModel);
+  assert.equal(route.modelRole, "strong");
+  assert.equal(route.tool, "read");
+  assert.match(route.fallbackReason, /Model selection was uncertain/);
+  assert.match(route.fallbackReason, /Tool selection was uncertain/);
+});
+
+test("routing keeps the existing confidence boundary and relevance threshold", async () => {
+  const boundary = DEFAULT_SETTINGS.routeConfidence;
+  const route = await fixture({ modelChoice: pick("fast", ["fast", "strong"], boundary), toolChoice: pick("search", ["read", "interact", "search"], boundary) }).client.route("Search public sources", OBSERVATION);
+  assert.equal(route.modelRole, "fast");
+  assert.equal(route.tool, "search");
+  assert.equal(route.fallbackReason, null);
+  assert.equal(DEFAULT_SETTINGS.minimumRelevance, 0.55);
 });
 
 test("missing models fail before inference", async () => {
