@@ -153,6 +153,104 @@ def test_paced_typing_emits_intermediate_input_and_get_search_navigates(actor):
     assert parse_qs(urlsplit(actor.url).query) == {"q": ["asyncio"], "area": ["default"]}
 
 
+def append_auxiliary_button(actor, *, label="Remove Canvas", button_type="button", hidden=True, name=None, identifier="aux-button"):
+    """Add a native auxiliary UI button without activating its handler."""
+    actor.evaluate("""options => {
+        const button=document.createElement('button');
+        button.id=options.identifier; button.textContent=options.label; button.hidden=options.hidden;
+        if (options.button_type !== null) button.setAttribute('type',options.button_type);
+        if (options.name !== null) button.name=options.name;
+        button.value='fixture-mode';
+        button.onclick=() => { fixture.auxiliaryClicks=(fixture.auxiliaryClicks || 0)+1; };
+        document.querySelector('form').append(button);
+    }""", {"label": label, "button_type": button_type, "hidden": hidden, "name": name, "identifier": identifier})
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+@pytest.mark.parametrize("kind", ["click", "press"])
+def test_unrelated_non_submit_buttons_and_empty_pickers_allow_get_search(actor, hidden, kind):
+    append_file_picker(actor)
+    append_auxiliary_button(actor, label="A workspace to create, edit, and save your progress", hidden=hidden, identifier="canvas")
+    append_auxiliary_button(actor, label="Canvas Remove Canvas", hidden=hidden, identifier="remove-canvas")
+    append_auxiliary_button(actor, label="Create Remove Create Images", hidden=hidden, name="mode", identifier="remove-images")
+    first = observation(actor)
+    assert execute(actor, action_for(first, "type", "Search jobs", text="backend Israel"))["status"] == "executed"
+    assert actor.locator("#query").input_value() == "backend Israel"
+    assert actor.evaluate("() => fixture.auxiliaryClicks || 0") == 0
+    snapshot = observation(actor)
+    action = action_for(snapshot, "click", "Go") if kind == "click" else action_for(snapshot, "press", "Search jobs", key="Enter")
+    assert execute(actor, action)["navigation"] is True
+    actor.wait_for_url("**/search?**")
+    assert parse_qs(urlsplit(actor.url).query) == {"q": ["backend Israel"], "area": ["default"]}
+
+
+@pytest.mark.parametrize("button_type", [None, "", "invalid-type", "submit", "reset"])
+def test_default_invalid_submit_and_reset_buttons_remain_in_form_safety_scan(actor, button_type):
+    append_auxiliary_button(actor, button_type=button_type)
+    expected_type = "reset" if button_type == "reset" else "submit"
+    assert actor.locator("#aux-button").evaluate("button => button.type") == expected_type
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "type", "Search jobs", text="blocked"))["code"] == "manual_review"
+    assert actor.locator("#query").input_value() == ""
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "click", "Go"))["code"] == "manual_review"
+    assert actor.evaluate("() => fixture.auxiliaryClicks || 0") == 0
+    assert actor.url == HOME
+
+
+@pytest.mark.parametrize("label", ["Remove Canvas", "A workspace to create, edit, and save your progress"])
+def test_direct_sensitive_non_submit_button_stays_blocked(actor, label):
+    append_auxiliary_button(actor, label=label, hidden=False)
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "click", label))["code"] == "manual_review"
+    assert actor.evaluate("() => fixture.auxiliaryClicks || 0") == 0
+
+
+@pytest.mark.parametrize("name", ["access_token", "csrf_token", "session_id"])
+def test_non_submit_buttons_with_credential_names_stay_blocked(actor, name):
+    append_auxiliary_button(actor, label="Tools", name=name)
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "type", "Search jobs", text="blocked"))["code"] == "manual_review"
+    assert actor.locator("#query").input_value() == ""
+
+
+@pytest.mark.parametrize("button_type", [None, "", "invalid-type", "submit"])
+@pytest.mark.parametrize("override,value", [("formmethod", "post"), ("formtarget", "_blank")])
+def test_enter_checks_native_default_submitter_with_missing_or_invalid_type(actor, button_type, override, value):
+    actor.evaluate("""({button_type,override,value}) => {
+        const button=document.querySelector('#go');
+        if (button_type !== null) button.setAttribute('type',button_type);
+        button.setAttribute(override,value);
+    }""", {"button_type": button_type, "override": override, "value": value})
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "press", "Search jobs", key="Enter"))["code"] == "manual_review"
+    assert actor.url == HOME
+
+
+@pytest.mark.parametrize("button_type", [None, "", "invalid-type", "submit"])
+def test_auxiliary_button_becoming_submitter_during_typing_stops_next_character(actor, button_type):
+    append_auxiliary_button(actor)
+    actor.evaluate("""button_type => document.querySelector('#query').addEventListener('input', event => {
+        if (event.target.value !== 'a') return;
+        const button=document.querySelector('#aux-button');
+        if (button_type === null) button.removeAttribute('type');
+        else button.setAttribute('type',button_type);
+    })""", button_type)
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "type", "Search jobs", text="abc"))["code"] == "manual_review"
+    assert actor.locator("#query").input_value() == "a"
+    assert actor.evaluate("() => fixture.auxiliaryClicks || 0") == 0
+    assert actor.url == HOME
+
+
+def test_auxiliary_button_does_not_relax_non_get_form_boundary(actor):
+    append_auxiliary_button(actor)
+    actor.evaluate("() => document.querySelector('form').method='post'")
+    snapshot = observation(actor)
+    assert failure(actor, action_for(snapshot, "type", "Search jobs", text="blocked"))["code"] == "manual_review"
+    assert actor.locator("#query").input_value() == ""
+
+
 def append_file_picker(actor, *, name=None, hidden=True, inside_form=True):
     """Add an ordinary native file control to the isolated public-search fixture."""
     actor.evaluate("""options => {

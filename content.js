@@ -120,7 +120,7 @@
     if (!form) return null;
     return Array.from(form.elements).find((element) => {
       const info = metadata(element);
-      return !info.disabled && (info.tag === "button" && (!info.type || info.type === "submit") ||
+      return !info.disabled && (info.tag === "button" && element.type === "submit" ||
         info.tag === "input" && ["submit", "image"].includes(info.type));
     }) || null;
   }
@@ -143,8 +143,11 @@
       const emptyAuxiliaryFile = info.tag === "input" && info.type === "file" &&
         control.hidden === true && !visible(control) && info.name === "" &&
         control.files instanceof FileList && control.files.length === 0;
-      if (emptyAuxiliaryFile) continue;
-      if (info.sensitive || /(?:password|token|secret|csrf|auth|session|credential)/i.test(info.name)) {
+      const credentialName = /(?:password|token|secret|csrf|auth|session|credential)/i.test(info.name);
+      // An unrelated non-submit button's label is not submitted form data.
+      const auxiliaryButton = info.tag === "button" && control.type === "button" && control !== submitter;
+      if (!credentialName && (emptyAuxiliaryFile || auxiliaryButton)) continue;
+      if (info.sensitive || credentialName) {
         fail("manual_review", "This form contains a sensitive control and needs manual handling.");
       }
     }
